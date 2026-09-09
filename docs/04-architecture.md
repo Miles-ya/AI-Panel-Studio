@@ -54,6 +54,7 @@ docs/
 ```text
 LLMProvider
   ├─ generate_cast(input) -> CastOutput
+  ├─ select_next_speaker(input) -> SpeakerSelectionOutput
   ├─ generate_turn(input, selected_participant) -> TurnOutput
   ├─ extract_insights(input) -> InsightOutput
   └─ summarize(input) -> SummaryOutput
@@ -62,7 +63,7 @@ DeepSeekLLMProvider：调用 DeepSeek V4 Pro
 FakeLLMProvider：返回受控数据，服务于测试/演示
 ```
 
-真实模型有费用、网络、限流和非确定性，pytest/Playwright 不能依赖它。Fake 应能模拟正常、非法 JSON、超长发言、重复 Insight、上游失败，保证核心规则可重复验证。
+真实模型有费用、网络、限流和非确定性，pytest/Playwright 不能依赖它。Fake 应能模拟正常、非法 JSON、非法选人、超长发言、Insight 失败和上游失败，保证核心规则可重复验证。
 
 ## 4. AI 核心模块
 
@@ -72,15 +73,15 @@ FakeLLMProvider：返回受控数据，服务于测试/演示
 
 ### FloorScheduler
 
-FloorScheduler 是进程内确定性候选选择器，而非一次额外模型调用；它是 `public_focus` 的唯一来源。候选确定后，Runner 立即持久化该 Participant 的安全关注点并发布 `preparing`/`speaking` 状态，再调用一次 `generate_turn(input, selected_participant)`。`TurnOutput` **只**包含该角色 1–2 句公开发言及是否结束；不含 speaker、`public_focus`、intent 或其他内部字段。
+FloorScheduler 通过一次 `select_next_speaker` 模型调用，向模型提供本场 Participants、Transcript 和活跃 Insights；模型返回候选 `participant_id` 与一句用户可见的 `public_focus`。Runner 验证候选后持久化该 Participant 的公开关注点并发布 `preparing`/`speaking` 状态，再调用一次 `generate_turn(input, selected_participant)`。`TurnOutput` **只**包含该角色 1–2 句公开发言及是否结束；不含 speaker、`public_focus`、intent 或其他内部字段。
 
-候选规则固定为可测试的窗口 `2`：首轮必为主持人；之后先排除上一位 speaker，若候选仍多于一人再排除最近两条 Utterance 的 speaker。若最新发言以 `？` 或 `?` 结束，优先专家；若最新发言人为主持人，同样优先专家；其余情况下，只有自上次主持人发言后已出现至少 2 位专家发言时才优先主持人，否则优先专家。在优先角色的候选中，按“发言次数最少 → 最近一次发言 sequence 最小（最久未发言）→ Participant ID 升序”选择；若优先角色无候选，再对全部合格候选用同一评分。每个分支同时生成固定安全 `public_focus`：回答问题为“正在回应当前问题”，专家补充为“正在补充不同视角”，主持人串联为“正在串联当前观点”。这样调度可利用 Transcript 的末条句式、角色和历史，同时避免固定轮转。Runner 累计到第 15 条公开发言时必须转入收束，不再调度新的专家发言。
+应用层只实施四条可验证约束：首轮必须选择主持人；候选必须属于本场；有其他候选时不得连续选择上一位发言人；用户停止或已保存 15 条公开发言时不再选择下一位。其余发言顺序由模型依据上下文决定，避免把 MVP 固化为机械轮转。`public_focus` 是模型明确生成的公开摘要，限制为单句且最长 50 字符；Schema 禁止 `reasoning`、`chain_of_thought`、`intent` 等额外字段，服务端不请求或保存隐藏推理。
 
 > 架构决策：采用“确定性候选选择 + 单次模型发言输出 + 服务端硬约束”。不合规输出最多校正重试一次；仍失败即以 `discussion.error` 结束为 `FAILED`。这避免额外模型调用、无限等待和伪造无限自治能力。
 
 ### InsightExtractor
 
-输入新增 Utterance 与现有活跃 Insight；输出结构化 `upsert` 和 `deactivate` 操作。服务端按 ID 事务更新再发布事件。提示词目标为“当前仍有效的简短判断”，避免每轮无意义新增同义内容。
+输入新增 Utterance 与现有活跃 Insight；输出当前活跃共识与分歧的完整小集合，每类最多两项。服务端在单一事务内替换本场活跃集合再发布事件。提示词目标为“当前仍有效的简短判断”，避免每轮无意义追加。
 
 ## 5. DiscussionRunner
 
@@ -91,7 +92,7 @@ Discussion A -> Runner A -> Event Stream A
 Discussion B -> Runner B -> Event Stream B
 ```
 
-注册表以 `discussion_id` 为键，并通过进程内 `asyncio.Lock` 原子占位，防止重复启动；不实现容量调度系统。Runner 仅查询、修改、发布自身 ID；它拥有取消事件、当前 task、局部上下文。异常仅将自身置 `FAILED` 并广播错误，不能终止其他 Runner。后端重启时不恢复任何 Runner；启动检查发现遗留 `RUNNING` 记录必须标记为 `FAILED`。
+注册表以 `discussion_id` 为键，并通过进程内 `asyncio.Lock` 原子占位，防止重复启动；不实现容量调度系统。Runner 仅查询、修改、发布自身 ID；它拥有取消事件、当前 task、局部上下文。异常仅将自身置 `FAILED` 并广播错误，不能终止其他 Runner。MVP 不提供进程重启后的 Runner 恢复或历史运行状态修正。
 
 > 架构决策：单进程内存 Runner 适合本地演示。生产多实例时需 Redis/数据库租约、任务队列、共享事件总线；MVP 不声称具备该能力。
 
@@ -108,7 +109,9 @@ sequenceDiagram
     participant E as SSE EventHub
     participant UI as Frontend
     R->>F: 提供 Transcript、角色与历史
-    F-->>R: selected_participant + safe public_focus
+    F->>L: 选择下一位公开发言者
+    L-->>F: selected_participant + public_focus
+    F-->>R: 已校验的 selected_participant + public_focus
     R->>DB: 持久化 preparing + public_focus
     R->>E: participant.status.changed(preparing)
     E-->>UI: 状态事件
@@ -123,7 +126,7 @@ sequenceDiagram
     R->>I: 传入新增发言与当前 Insights
     I->>L: 请求 Insight 增量
     L-->>I: 结构化 InsightOutput
-    I->>DB: upsert / deactivate Insights（事务）
+    I->>DB: 替换活跃 Insights（事务）
     I->>E: insights.updated
     E-->>UI: 更新共识与分歧
     R->>DB: 持久化 idle + public_focus=null
@@ -134,9 +137,9 @@ sequenceDiagram
 
 ## 7. 专家状态设计
 
-对用户只显示**待机、准备发言、发言中**及 `public_focus`，例如“正在回应当前问题”。这些是由 FloorScheduler 生成的受控公开摘要，而非模型推理。
+对用户只显示**待机、准备发言、发言中**及 `public_focus`，例如“正在聚焦转岗成本”。它是模型专门生成的用户可见摘要，不是模型隐藏推理。
 
-禁止请求、存储、记录或下发隐藏 Chain-of-Thought。模型不返回 `public_focus`；服务端仅持久化 FloorScheduler 生成的固定安全关注点。内部调度理由、完整提示词、模型原始分析、token 信息均不属于前端契约。调试日志亦应脱敏。
+禁止请求、存储、记录或下发隐藏 Chain-of-Thought。模型仅在结构化 `SpeakerSelectionOutput` 中返回受限的公开摘要；`reasoning`、`chain_of_thought`、`intent` 等字段由 Schema 拒绝。内部调度理由、完整提示词、模型原始分析、token 信息均不属于前端契约。调试日志亦应脱敏。
 
 ## 8. 多讨论隔离
 
@@ -146,7 +149,7 @@ sequenceDiagram
 | Application Service | 命令先加载目标聚合并验证状态，不接受外部归属覆盖 |
 | DiscussionRunner | 注册表、锁、取消事件、上下文、task 都按 ID 建立 |
 | SSE | 专属 subscriber 集合，只向同 ID 广播；每个 event 强制带 ID |
-| Frontend State | `Record<discussion_id, StudioState>` 或路由切片；先比对事件 ID 再消费 |
+| Frontend State | `Record<discussion_id, StudioState>` 或路由切片；只消费当前路由 Discussion 的事件，连接时以 snapshot 覆盖 |
 
 ## 9. AI 输出 Schema
 
@@ -155,8 +158,8 @@ sequenceDiagram
 | 场景 | 校验 | retry | fallback |
 | -- | -- | -- | -- |
 | 嘉宾 | 角色数、字段、颜色、长度 | 一次校正提示 | 返回错误，保持 `DRAFT` |
-| 调度/发言 | speaker 归属、状态、句数、长度、公开字段安全 | 一次 | 仍失败为 `FAILED`；先持久化最终状态再发 `discussion.error` |
-| Insight | 类型、操作、内容、目标 ID 归属 | 一次 | 跳过本轮，保留旧值 |
+| 选人/发言 | speaker 归属、首轮/连续限制、句数、长度、公开字段安全 | 一次 | 仍失败为 `FAILED`；先持久化最终状态再发 `discussion.error` |
+| Insight | 类型、内容、每类最多两项 | 一次 | 跳过本轮，保留旧值 |
 | 总结 | 自然语言、长度 | 一次 | 保存“总结暂不可用”、标记 `summary_status=fallback`，仍 `FINISHED`；可由 `retry-summary` 再次受理 |
 
 不无限重试：每次模型调用最多一次校正重试，避免费用、延迟和卡死。
@@ -167,13 +170,13 @@ sequenceDiagram
 | -- | -- | -- |
 | LLM 非确定性 | Structured Output、Pydantic、Fake 回归 | 模型评测集、版本锁定、可观测性 |
 | 多讨论并发模型调用 | 每 Runner 独立 task；MVP 不做容量调度 | 队列、限流、分布式 worker |
-| SSE 断线 | 重连后 GET 快照、事件 ID 去重 | Last-Event-ID 回放、持久事件日志 |
+| SSE 断线 | 浏览器重连后接收完整 snapshot | Last-Event-ID 回放、持久事件日志 |
 | 非法 JSON | 一次校正重试、错误码 | schema mode/函数调用、上游监控 |
 | 发言过长 | 输出长度和句数校验 | token 预算、压缩、质量评测 |
 | 专家立场趋同 | Cast 差异提示、调度携带 stance | 相似度检测和重生 |
-| 机械轮流 | 上下文调度、连续/循环惩罚 | 学习型策略、人工标注 |
-| Insight 无限重复 | upsert/deactivate、活跃集合上限 | 语义去重、观点图 |
-| 页面不同步 | snapshot、去重、重连全量同步 | 事件序号、版本号、回放 |
+| 机械轮流 | 模型基于上下文选人 + 最小连续发言限制 | 学习型策略、人工标注 |
+| Insight 无限重复 | 每轮替换小型活跃集合 | 语义去重、观点图 |
+| 页面不同步 | 每次 SSE 连接发送完整 snapshot | 事件序号、版本号、回放 |
 | SQLite 并发限制 | 短事务、单机有限并发、验证后 WAL | PostgreSQL、连接池、队列写入 |
 
 ## 架构决策记录（ADR 摘要）

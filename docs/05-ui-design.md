@@ -13,7 +13,7 @@ AI Panel Studio 的核心体验不是“聊天页面”，而是用户在观看�
 - **现场感**：动态的嘉宾状态、最新发言强调与实时 Insight 更新共同传达讨论正在推进。
 - **信息中心明确**：Transcript 是演播厅最大、视觉权重最高的区域；专家与 Insights 是理解上下文的辅助面板。
 - **可信而克制**：展示公开状态与关注点，不将模型内部意图、举手事件或 Chain-of-Thought 伪装成真人思考过程。
-- **可观察**：运行中、结束、降级错误、重连均有清晰状态，不以空白或无限 loading 掩盖。
+- **可观察**：运行中、结束和降级错误均有清晰状态，不以空白或无限 loading 掩盖。
 - **MVP 克制**：不增加登录、评论、聊天室、音视频、手动编辑发言或未定义的控制能力。
 
 ### 1.2 页面与状态范围
@@ -49,7 +49,7 @@ flowchart LR
 | 产品标识 | 返回首页 | 不丢失运行中 Discussion，离开仅停止浏览 |
 | 页面标题 | 首页显示“讨论现场”；演播厅截断显示话题 | 话题完整文本可通过 hover/focus 查看 |
 | 发起讨论 | 进入创建页 | 演播厅中为次要按钮，不能覆盖 Start/停止操作 |
-| SSE 状态 | 显示“实时连接 / 正在重连 / 已离线” | 仅传达连接状态，不暴露实现细节 |
+| SSE 状态 | 显示“实时连接 / 正在连接” | 仅传达连接状态，不暴露实现细节 |
 
 ### 2.2 视觉语言
 
@@ -64,7 +64,7 @@ flowchart LR
 | 次文字 | `slate-400` | 时间、职业、说明 |
 | 主操作 | `indigo-500` 至 `indigo-600` | Start、确认、重试 |
 | 成功/在线 | `emerald-400` | 实时连接、完成 |
-| 警告 | `amber-400` | 正在重连、总结重试中 |
+| 警告 | `amber-400` | 总结重试中 |
 | 错误 | `rose-400` | 失败、无法加载 |
 
 Participant 的 `color` 是身份色，必须保留其 API 值；仅用于头像边缘、姓名标识条、发言左侧色条和 speaking 环，不应用作大面积底色。所有文字仍须满足深色背景下可读性，身份色不能是判断状态的唯一方式。
@@ -163,7 +163,7 @@ Transcript 是视觉中心，占据最高可用高度与最大列宽。嘉宾状
 
 #### 观点面板（Insight Rail）
 
-分为“已形成共识”和“关键分歧”两张独立卡片，使用不同图标与柔和色调区分，但仍以文字标题区分。每项只显示 Insight `content`；不显示模型置信度、隐藏来源链或内部操作。空状态分别为“共识正在形成”“分歧尚未显现”。更新时仅对变更条目做短暂高亮，避免整栏闪烁。
+分为“已形成共识”和“关键分歧”两张独立卡片，使用不同图标与柔和色调区分，但仍以文字标题区分。每项只显示 Insight `content`；不显示模型置信度、隐藏来源链或内部操作。空状态分别为“共识正在形成”“分歧尚未显现”。每次更新以当前完整活跃集合替换面板内容。
 
 ### 3.5 演播厅结束与失败状态
 
@@ -208,17 +208,14 @@ Transcript 是视觉中心，占据最高可用高度与最大列宽。嘉宾状
 
 ## 5. 实时状态、Loading 与错误反馈
 
-### 5.1 SSE 状态机（前端可见）
+### 5.1 SSE 连接状态（前端可见）
 
 ```mermaid
 stateDiagram-v2
     [*] --> LoadingSnapshot
-    LoadingSnapshot --> Live: 快照与 SSE 已连接
-    LoadingSnapshot --> LoadError: 快照请求失败
-    Live --> Reconnecting: EventSource 断开
-    Reconnecting --> Live: 重连并同步快照
-    Reconnecting --> Offline: 超过重连窗口
-    Offline --> Reconnecting: 用户重试
+    LoadingSnapshot --> Live: 收到 SSE snapshot
+    LoadingSnapshot --> LoadError: 连接或快照失败
+    Live --> LoadingSnapshot: EventSource 自动重连
     LoadError --> LoadingSnapshot: 用户重试
 ```
 
@@ -227,8 +224,7 @@ stateDiagram-v2
 | 首次加载聚合快照 | 页面骨架屏，保持标题骨架布局 | 无需操作 |
 | 嘉宾生成中 | 阵容区骨架卡 + “正在邀请嘉宾” | 禁用重复生成 |
 | Start 已受理、尚无发言 | 舞台占位 + “主持人正在开场” | 可返回首页；停止按钮按后端状态显示 |
-| SSE 重连 | 顶栏黄色状态“正在重新连接”，保留历史内容 | 自动重连；提供手动重试 |
-| SSE 离线 | 非模态横幅“实时连接已断开，内容可能不是最新” | 重新连接 |
+| SSE 重连 | 顶栏显示“正在连接” | 浏览器自动重连并等待新 snapshot |
 | API/模型可恢复错误 | 就地错误文案 + 重试按钮 | 重试相同动作 |
 | `discussion.error`/`FAILED` | 红色横幅，保留现场已有内容 | 返回首页或新建讨论 |
 
@@ -240,7 +236,7 @@ Toast 只用于短暂、非关键成功反馈（如“阵容已确认”）；�
 | -- | -- | -- |
 | `participant.status.changed` | 仅更新对应嘉宾卡状态和公开关注点 | 不重置其他嘉宾或 Transcript 滚动 |
 | `utterance.created` | 追加/排序一条发言，按自动滚动规则处理 | 不显示内部调度意图 |
-| `insights.updated` | 按 Insight ID upsert，仅高亮变化项 | 不清空未变更 Insight |
+| `insights.updated` | 以事件中的完整活跃集合替换观点面板 | 不修改 Transcript 滚动位置 |
 | `discussion.finished` | 更新结束横幅与总结卡，停止 live 动效 | 不删除历史发言或 Insights |
 | `discussion.error` | 显示持久错误横幅，随后以详情快照校准 | 不伪造“已结束”或自动丢弃内容 |
 
@@ -255,9 +251,9 @@ Toast 只用于短暂、非关键成功反馈（如“阵容已确认”）；�
 | `CreateDiscussionForm` | 输入与字段级验证反馈 | topic、expert_count、提交状态 | 专家数仅 2–8，默认 4 |
 | `CastGrid` | 主持人/专家阵容展示 | Participants | 不显示 runtime 状态或隐藏推理 |
 | `ParticipantStatusCard` | 演播厅嘉宾公开状态 | Participant | 只显示三种状态和 `public_focus` |
-| `TranscriptPanel` | 有序发言、自动滚动、新消息提示 | Utterances、Participants、scroll state | 只渲染公开 content，按 ID 去重/sequence 排序 |
+| `TranscriptPanel` | 有序发言、自动滚动、新消息提示 | Utterances、Participants、scroll state | 只渲染公开 content，按 sequence 排序 |
 | `UtteranceItem` | 一条发言 | Utterance + speaker 映射 | 身份色不应是唯一身份提示 |
-| `InsightPanel` | 共识或分歧条目 | active Insights | 更新采用 upsert，不无限追加 |
+| `InsightPanel` | 共识或分歧条目 | active Insights | 接收完整活跃集合，不无限追加 |
 | `StudioControls` | Start、停止、重试总结 | Discussion status、cast_confirmed、summary_status、请求状态 | 仅出现 API 契约允许的操作 |
 | `SummaryCard` | 自然语言总结/降级/重试状态 | summary、summary_status | 不展示 JSON 原文 |
 | `InlineFeedback` | loading、error、empty、reconnect | UI 状态 | 关键信息可持久阅读、可键盘访问 |
@@ -281,7 +277,7 @@ UI UX Pro Max 用于 DDD 阶段生成/迭代页面和组件时，必须遵守下
 3. 演播厅视觉中心永远是 Transcript；桌面侧栏不能使正文列低于约 560px，窄屏改为堆叠而非压缩。
 4. 只使用 `idle`、`preparing`、`speaking` 三种用户可见专家状态；`public_focus` 必须是公开摘要，绝不展示 CoT、内部意图或“举手”。
 5. 按 `discussion_id` 隔离前端状态和 EventSource；组件不得从其他演播厅复用或混入数据。
-6. 依据 SSE 的局部事件更新局部组件，不用整页重载模拟实时性；重连后以 GET 详情校准。
+6. 依据 SSE 的局部事件更新局部组件，不用整页重载模拟实时性；每次连接以服务端 snapshot 建立本场状态。
 7. 必须实现独立滚动和 Transcript 自动滚动暂停规则；禁止新增发言时强制打断用户阅读历史。
 8. 状态、loading、空态、错误、总结降级和重试必须按本文有明确 UI；禁止静默失败或无限旋转 loading。
 9. 使用 shadcn/ui 作为基础可访问组件并用 Tailwind 实现设计 token；不引入额外重量级视觉框架。

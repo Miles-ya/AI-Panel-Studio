@@ -11,7 +11,7 @@
 ### 1.1 测试目标
 
 - 证明 Discussion 生命周期、数量、归属与 15 条公开发言上限等领域规则受保护。
-- 证明 CastGenerator、FloorScheduler、InsightExtractor、DiscussionRunner 在可控输入下有确定行为。
+- 证明 CastGenerator、LLM 驱动的 FloorScheduler、InsightExtractor、DiscussionRunner 在可控输入下受既定约束保护。
 - 证明 REST 与 SSE 符合既定 API 契约，且一个 Discussion 的事件/数据不能进入另一场。
 - 证明 UI 能完成创建、确认、显式 Start、实时观察、结束和降级重试的关键路径。
 - 证明任何公开 API、SSE、持久化对象或 UI 都不输出 Chain-of-Thought、内部发言意图、完整提示词或 API Key。
@@ -63,9 +63,9 @@ flowchart LR
 | 1 | 创建合法/非法 Discussion 与默认专家数 | 领域创建、2–8 校验、默认 4 | 提取值对象/枚举，不改 API 行为 |
 | 2 | 生成阵容必须有 1 主持人和 N 专家 | Cast 输出校验并持久化至 `CAST_READY` | 提取 CastValidator 与颜色校验 |
 | 3 | 非法生命周期转换被拒绝 | confirm/start/stop 状态守卫 | 统一状态转换错误映射 |
-| 4 | 调度不能固定轮询或连续同人 | FloorScheduler 硬约束与一次校正 | 分离候选评分与模型建议 |
+| 4 | 模型选人不得违反首轮、归属和连续发言限制 | FloorScheduler 校验选择结果与一次校正 | 保持模型选择输入最小 |
 | 5 | 发言保存后才推送事件 | Runner 最小单回合 + EventHub | 提取事件构造/事务边界 |
-| 6 | Insight 同义更新不无限追加 | upsert/deactivate 应用服务 | 抽取 Insight 操作校验 |
+| 6 | Insight 更新为当前完整活跃集合 | 替换活跃集合应用服务 | 抽取集合校验 |
 | 7 | 第 15 条发言后收束 | Runner 停止调度、生成总结 | 整理终止条件与取消路径 |
 | 8 | 两场讨论不串数据/事件 | 按 ID 的 repository、Runner、EventHub | 提取隔离守卫和测试工厂 |
 | 9 | UI 显式 Start、SSE 局部更新 | 前端页面和测试服务端 | 整理组件、stores 和 selectors |
@@ -76,11 +76,13 @@ flowchart LR
 
 **Refactor 阶段要求**：重构前后运行同一组单元、集成和相关 E2E 测试；若需改契约，先更新 SDD 文档并新增/调整 Red 测试，不能静默改变接口。
 
+**Git 过程要求**：每个 TDD 垂直切片先提交仅包含失败行为测试的 `test:` 提交并停止；开发者明确继续后，再以对应 `feat:` 提交最小 Green 实现和回归结果并再次停止。这样提交历史可真实呈现 tests → feat 的演进。
+
 ## 4. FakeLLMProvider 设计
 
 ### 4.1 职责与接口一致性
 
-Fake 必须实现与 `LLMProvider` 相同的四个动作：`generate_cast`、`generate_turn`、`extract_insights`、`summarize`。`generate_turn` 接受服务端已选择的 speaker，只返回公开发言和是否结束；`public_focus` 由 FloorScheduler 生成。它返回与生产 Provider 相同的结构化 DTO 或明确的受控异常；业务层不应通过 `isinstance(FakeLLMProvider)` 分支。
+Fake 必须实现与 `LLMProvider` 相同的五个动作：`generate_cast`、`select_next_speaker`、`generate_turn`、`extract_insights`、`summarize`。`select_next_speaker` 返回模型选择的 speaker 与一句公开 `public_focus`；`generate_turn` 接受该已验证的 speaker，只返回公开发言和是否结束。它返回与生产 Provider 相同的结构化 DTO 或明确的受控异常；业务层不应通过 `isinstance(FakeLLMProvider)` 分支。
 
 Fake 的目标不是模仿模型文采，而是让测试精确表达“本次调用应返回什么、应失败在哪里、调用了几次”。每个测试通过 fixture 注入独立脚本，默认没有全局可变的共享响应队列。
 
@@ -88,8 +90,9 @@ Fake 的目标不是模仿模型文采，而是让测试精确表达“本次调
 
 | 场景 | Fake 行为 | 主要测试用途 |
 | -- | -- | -- |
-| `happy_path` | 返回合规阵容、短发言、Insight、总结 | 主流程与 E2E |
+| `happy_path` | 返回合规阵容、合法选人/公开关注点、短发言、Insight、总结 | 主流程与 E2E |
 | `invalid_cast_once` | 第一次阵容结构非法，第二次合规 | 验证一次校正重试 |
+| `invalid_selection` | 选择跨场嘉宾、连续同人或带隐藏字段的输出 | 验证选人校验与 `FAILED` |
 | `invalid_turn` | 为已选择 speaker 返回非法公开字段或发言 | 验证校验与 `FAILED` |
 | `long_utterance` | 返回超过 2 句或长度限制 | 验证内容校验与不持久化 |
 | `insight_failure` | 提炼 Insight 抛出受控异常 | 验证发言保留、旧 Insight 不丢失 |
@@ -113,7 +116,6 @@ Fake 的目标不是模仿模型文采，而是让测试精确表达“本次调
 | Utterance 完整性 | speaker 与 Discussion 同属；sequence 单调且唯一；内容 1–2 句且限长 |
 | Insight 完整性 | type 枚举、归属正确；active 与更新时间维护正确 |
 | 总结状态 | `FINISHED` 需 finished_at；成功为 `succeeded`，双失败为 `fallback`，仅 fallback 可重试 |
-| 重启恢复 | 遗留 `RUNNING` 标记为 `FAILED`/`RUNNER_RECOVERY_REQUIRED`，不创建 Runner |
 
 ### 5.2 CastGenerator
 
@@ -132,31 +134,28 @@ Fake 的目标不是模仿模型文采，而是让测试精确表达“本次调
 
 ### 5.3 FloorScheduler
 
-FloorScheduler 的单元测试以固定 participants、发言历史、活跃 Insights 驱动；它不调用模型，负责在生成前确定候选 speaker。Fake 仅用于随后该角色的发言生成。
+FloorScheduler 的单元测试以固定 participants、发言历史和 Fake 的模型选择结果驱动；它不为模型评分，而是验证模型选择是否满足最小应用层约束。Fake 随后用于该角色的发言生成。
 
 | 场景 | 预期 |
 | -- | -- |
-| 首轮 | 选择主持人作为首位候选，并生成“正在串联当前观点” |
-| 窗口规则 | 最近窗口固定为 2；先排除上一位，候选多于一人时再排除最近两位 |
-| 最新问句 | 最新内容以 `？`/`?` 结束时优先专家，并按次数最少→最久未发言→ID 选择 |
-| 主持人后 | 最新 speaker 为主持人时优先专家；连续同人不可能发生 |
-| 普通陈述 | 自上次主持人后不足 2 位专家发言时优先专家，否则优先主持人 |
-| 跨场/不存在 speaker | Scheduler 不会选择任何不属于本场的 Participant |
-| 内部 intent | 即使模型返回 intent，公开 Utterance 与 SSE DTO 也不含它 |
+| 首轮 | 非主持人选择被拒绝；主持人选择通过 |
+| 连续发言 | 有其他 Participant 时，选择上一位 speaker 被拒绝 |
+| 跨场/不存在 speaker | Scheduler 拒绝任何不属于本场的 Participant |
+| 合法选择 | 本场且满足最小约束的模型选择被接受，并保留其公开关注点 |
+| 公开字段 | `public_focus` 为最长 50 字符的单句文本；额外 reasoning/intent 字段被拒绝 |
 | 15 条边界 | 第 15 条已保存后不调用下一次 generate_turn，转入总结 |
 | 用户 stop | 取消标记出现后不再开始下一轮调度 |
 
-“非机械轮流”不是要求随机：测试验证明确的负向约束（连续同人、重复循环）和上下文输入被传给 Provider，不对某一个具体专家身份做脆弱断言。
+“非机械轮流”不是要求测试预测某个固定身份：测试只验证完整上下文传入 Provider，以及首轮、归属、连续发言这些负向约束。
 
 ### 5.4 InsightExtractor
 
 | 场景 | 预期 |
 | -- | -- |
 | 新共识/分歧 | 创建正确 type、active=true 的 Insight |
-| 同一 Insight upsert | 更新 content/updated_at，不增加重复记录 |
-| deactivate | 既有 Insight 变为 active=false，不删除历史 |
-| 指向其他 Discussion 的 Insight ID | 拒绝操作，不能改写别场数据 |
-| 非法 type/空内容/未知操作 | Pydantic/服务校验失败；不产生部分更新 |
+| 完整集合替换 | 下一轮活跃集合替换上一轮，不累计重复内容 |
+| 跨场隔离 | 仅替换目标 Discussion 的集合，不能改写别场数据 |
+| 非法 type/空内容/超过每类两项 | Pydantic/服务校验失败；不产生部分更新 |
 | 提炼失败 | 已保存 Utterance 保留，上轮 active Insights 不丢失 |
 
 ### 5.5 Chain-of-Thought 安全单元测试
@@ -165,13 +164,13 @@ FloorScheduler 的单元测试以固定 participants、发言历史、活跃 Ins
 
 | 攻击/错误输入 | 必须断言 |
 | -- | -- |
-| Fake 在 TurnOutput 返还 `public_focus`、`reasoning`、`chain_of_thought`、`internal_intent` 等额外字段 | TurnOutput Schema 以 extra-forbid 拒绝；一次校正后仍非法则进入 `FAILED`，持久化/API DTO 无此字段 |
+| Fake 在 SpeakerSelectionOutput 返还 `reasoning`、`chain_of_thought`、`internal_intent` 等额外字段 | Selection Schema 以 extra-forbid 拒绝；一次校正后仍非法则进入 `FAILED`，持久化/API DTO 无此字段 |
 | Fake 在 Utterance 返还 intent 或调度解释 | 公共 Utterance 只保留 `content`；SSE 不含 intent |
 | Fake 在总结返还 JSON 包装/调试字段 | UI/API 仅消费自然语言 summary；禁止原始 JSON 直出 |
 | 服务错误 details 含 API Key 模式文本 | 错误净化后不含敏感值 |
-| Scheduler 输出不在允许模板内的 `public_focus` | 拒绝持久化/推送；实现只允许三条固定安全文案，原文不得写库或推送 |
+| Fake 返回超过 50 字符或多句的 `public_focus` | Selection Schema 拒绝；原文不得写库或推送 |
 
-> 架构决策：MVP 的 `public_focus` 不来自模型，只允许 FloorScheduler 的三条固定安全文案；因此无需替换或猜测模型推理，也不会传播原文。
+> 架构决策：`public_focus` 由模型作为独立公开字段生成，且服务端不请求隐藏推理。测试验证结构、长度、单句限制和额外字段拒绝，而不尝试检测模型私有思考。
 
 ## 6. Runner、持久化与多 Discussion 集成测试
 
@@ -181,7 +180,7 @@ FloorScheduler 的单元测试以固定 participants、发言历史、活跃 Ins
 | -- | -- |
 | 启动成功 | 仅在 `CAST_READY`、已确认后创建 Runner；Discussion 变为 `RUNNING` |
 | 重复 start | 同一 ID 不创建第二 Runner，返回 `409` 或等价冲突 |
-| 单轮顺序 | Scheduler 选定 speaker → `preparing` → `speaking` → 调用 generate_turn → Utterance 持久化 → `utterance.created` → Insight 更新（若成功）→ 持久化 `idle + public_focus=null` → `participant.status.changed(idle)`；发言事件不会早于数据库提交，最终 SQLite Participant 为 idle/null |
+| 单轮顺序 | 模型选人并经校验 → `preparing` → `speaking` → 调用 generate_turn → Utterance 持久化 → `utterance.created` → Insight 更新（若成功）→ 持久化 `idle + public_focus=null` → `participant.status.changed(idle)`；发言事件不会早于数据库提交，最终 SQLite Participant 为 idle/null |
 | 停止 | 不开启下一轮，完成总结/降级后 `FINISHED` 并发 `discussion.finished` |
 | 第 15 条 | 保存第 15 条后收束，不保存第 16 条 |
 | 发言校验失败 | 不持久化非法 Utterance；Runner 发 `discussion.error` 并进入 `FAILED` |
@@ -231,11 +230,11 @@ SSE 集成测试以测试客户端打开 A、B 两条 `/events` 流，并按帧�
 | 初次连接 | 第一条为 `discussion.snapshot`，其 discussion 与 GET 详情完整 DTO 同构且 ID 正确 |
 | 状态事件 | `participant.status.changed` 只含用户可见状态和 `public_focus` |
 | 发言事件 | `utterance.created` 在数据库含该 ID/sequence 后才收到，且不含 intent |
-| Insight 事件 | `insights.updated` 仅包含本场 Insight，能用于 upsert |
+| Insight 事件 | `insights.updated` 包含本场完整活跃集合，可直接替换 UI 状态 |
 | 结束事件 | `discussion.finished` 包含状态、summary、summary_status、finished_at |
 | 错误事件 | `discussion.error` 含统一 error、`final_status=FAILED`；状态已持久化且敏感信息已净化 |
 | 事件隔离 | A 流不出现 B 的任意 event/data；反之亦然 |
-| 断连重连 | 重新连接获得 snapshot；前端可用 GET 快照校准，MVP 不断言回放 |
+| 断连重连 | 重新连接的第一条仍为完整 snapshot；MVP 不断言回放或去重 |
 
 事件测试不假定跨事件绝对时间，只断言单轮因果顺序（持久化在发言事件前、结束后不再自动发言）。
 
@@ -284,8 +283,7 @@ Playwright 启动 Vite 前端和 FastAPI 测试服务；后端通过环境配置
 
 - 首页显示 `DRAFT`、`CAST_READY`、`RUNNING`、`FINISHED`、`FAILED` 状态卡及正确主操作。
 - 创建页边界：2 和 8 可提交，1 和 9 显示字段错误。
-- SSE 断线后显示重连提示，恢复后从 GET 快照校准，旧 Transcript 不丢失。
-- 后端启动清理遗留 `RUNNING` 后，首页显示该 Discussion 为 `FAILED`，没有假“直播中”状态。
+- SSE 重连后服务端发送 snapshot，页面以 snapshot 恢复本场状态。
 
 ## 9. 测试目录、命名与数据治理
 
@@ -339,8 +337,8 @@ e2e/
 ## 11. TDD + E2E 阶段验收清单
 
 - [ ] 每个核心模块先有可复现的 Red 测试，再进入最小 Green 实现和 Refactor。
-- [ ] `FakeLLMProvider` 覆盖正常、非法阵容一次、非法发言、Insight 失败、固定总结降级与重试、多 Discussion 隔离。
-- [ ] CastGenerator、FloorScheduler、InsightExtractor 的关键规则由 pytest 直接验证。
+- [ ] `FakeLLMProvider` 覆盖正常、非法阵容一次、非法选人、非法发言、Insight 失败、固定总结降级与重试、多 Discussion 隔离。
+- [ ] CastGenerator、FloorScheduler 的最小选择约束、InsightExtractor 的完整集合替换由 pytest 直接验证。
 - [ ] Runner 覆盖事务→事件顺序、停止、15 条上限、总结重试和资源清理。
 - [ ] API 和 SSE 测试覆盖成功、状态冲突、统一错误格式及所有规定事件。
 - [ ] 至少一组测试从数据库、Runner、SSE、前端四层证明多 Discussion 不串场。

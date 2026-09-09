@@ -670,6 +670,24 @@ public_focus
 
 ```
 
+## MVP 精简基线修订
+
+```markdown
+请以现有已审核的 PRD、领域模型、API、架构、UI 与测试策略为基线，做一次只减不扩的 MVP 修订。
+
+必须保留创建讨论、生成并确认阵容、显式开始、实时 Transcript、嘉宾公开状态、共识/分歧、总结、SSE、多 Discussion 隔离、TDD 与 Playwright 验收。
+
+请删除不影响上述验收的复杂设计：进程重启恢复、SSE 事件编号/回放/去重、复杂离线状态机、确定性多分支发言评分、Insight 语义 upsert 历史。
+
+将 FloorScheduler 改为模型基于本场 Participants、Transcript 和活跃 Insights 动态选择 speaker，并返回一条短的公开 public_focus。应用层只校验首轮主持人、同场归属、可替代候选存在时不连续同人，以及停止/15 条上限。public_focus 必须是独立公开字段；禁止请求、保存或输出 Chain-of-Thought、reasoning、intent。
+
+将 Insight 更新改为每轮返回当前完整活跃集合，每类最多两项，前端直接替换展示集合。SSE 每次连接先发完整 snapshot；不实现事件回放或去重。
+
+同步修订所有受影响文档，并指出任何尚存的冲突；不要生成业务实现代码。
+```
+
+意图：在不牺牲招聘方可观察验收项的前提下，将运行时和事件协议收缩到单机演示所需的最小集合。修订特别把“模型动态选人”与“隐藏推理不可见”拆为不同的结构化字段和应用层边界，避免将公开关注点误写成固定模板或 Chain-of-Thought。
+
 ```
 继续生成 `docs/05-ui-design.md`。
 基于前面已经完成的 PRD、领域模型、API 契约和架构文档，进入 DDD 阶段，完成 AI Panel Studio 的 UI/UX 设计文档。
@@ -907,6 +925,5 @@ Testing Strategy
 ```
 
 ```
-
 
 

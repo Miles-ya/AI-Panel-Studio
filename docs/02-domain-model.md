@@ -71,7 +71,7 @@ stateDiagram-v2
 | `stance` | 字符串 | 是 | 本讨论主要立场，不是隐藏推理 |
 | `color` | CSS HEX | 是 | `^#[0-9A-Fa-f]{6}$`；本场唯一 |
 | `runtime_status` | 枚举 | 是 | `idle`/`preparing`/`speaking` |
-| `public_focus` | 字符串/null | 否 | 用户可见简短关注点，不能含 CoT |
+| `public_focus` | 字符串/null | 否 | 模型生成的用户可见单句摘要，最长 50 字符；不能含 CoT |
 | `created_at` | UTC datetime | 是 | 创建时间 |
 
 > 设计假设：最新 `runtime_status` 与 `public_focus` 持久化以支持刷新；真正调度上下文、task、订阅者仅留内存。
@@ -82,7 +82,7 @@ stateDiagram-v2
 
 | 字段 | 类型 | 必填 | 约束/含义 |
 | -- | -- | -- | -- |
-| `id` | UUID 字符串 | 是 | 主键及 SSE 去重键 |
+| `id` | UUID 字符串 | 是 | 主键 |
 | `discussion_id` | UUID 字符串 | 是 | 外键，须与 participant 所属讨论一致 |
 | `participant_id` | UUID 字符串 | 是 | 发言人外键 |
 | `sequence` | 整数 | 是 | 本场从 1 单调递增且唯一 |
@@ -93,7 +93,7 @@ stateDiagram-v2
 
 ### Insight
 
-职责：保存当前有效的共识或分歧；同义观点更新旧记录，而不是无限追加。
+职责：保存当前有效的共识或分歧；每轮以本场最新活跃集合替换，避免无限追加。
 
 | 字段 | 类型 | 必填 | 约束/含义 |
 | -- | -- | -- | -- |
@@ -159,18 +159,18 @@ erDiagram
 7. `sequence` 本场唯一、递增；已保存 Utterance 不改写。
 8. `/confirm` 仅可作用于合规 `CAST_READY`，并持久化 `cast_confirmed=true` 与 `cast_confirmed_at`；`/start` 仅允许 `CAST_READY + cast_confirmed=true`。
 9. `CAST_READY` 重新生成阵容时，服务端先在内存生成并校验；成功后在单一事务中替换全体 Participant、重置确认字段为 false，状态保持 `CAST_READY`。生成/校验失败必须保留旧阵容与确认状态。
-10. 仅 `RUNNING` 可自动追加发言/更新 Insight；累计 15 条 Utterance 后必须进入收束；`FINISHED` 不再自动生成发言。
-11. 不可恢复 Runner 异常及连续调度/发言校验失败必须进入 `FAILED`，不提供恢复；Insight 提炼失败不影响已保存发言及下一轮。
+10. 仅 `RUNNING` 可自动追加发言/更新 Insight；每轮以新集合替换本场既有活跃 Insight（每类最多两项）；累计 15 条 Utterance 后必须进入收束；`FINISHED` 不再自动生成发言。
+11. 不可恢复 Runner 异常、模型选择越界或发言校验失败必须进入 `FAILED`，不提供恢复；Insight 提炼失败不影响已保存发言及下一轮。
 12. `FINISHED` 必须有 `finished_at`；总结成功则 `summary_status=succeeded`。`summary_status=fallback` 可在不改变 Discussion 生命周期的情况下重试总结。
-13. `public_focus` 仅可为公开摘要，禁止存储或下发隐藏推理。
+13. `public_focus` 是模型生成的一句公开摘要，仅允许随合法选择结果持久化；禁止存储或下发隐藏推理。
 
 ## 6. 运行时状态与持久化状态
 
 | 类别 | 内容 | 存放位置 | 原因 |
 | -- | -- | -- | -- |
-| 持久化领域事实 | 四个实体及最新公开状态 | SQLite | 刷新、重连、重启后可恢复展示 |
-| 运行协调 | `DiscussionRunner`、当前轮数、上下文窗口、取消标记 | 进程内按 ID 注册表 | 短生命周期，不是业务历史 |
-| 连接状态 | SSE subscriber、连接队列、心跳 | 进程内 EventHub | 仅连接存活期间有意义 |
+| 持久化领域事实 | 四个实体及最新公开状态 | SQLite | 刷新及重新连接后可展示 |
+| 运行协调 | `DiscussionRunner`、当前轮数、取消标记 | 进程内按 ID 注册表 | 短生命周期，不是业务历史 |
+| 连接状态 | SSE subscriber、连接队列 | 进程内 EventHub | 仅连接存活期间有意义 |
 | 异步控制 | LLM task、pending task、锁 | Runner 内存 | 防重复启动、受控停止 |
 
-进程重启后发现 `RUNNING` 但不存在 Runner 的记录，不得假装继续；MVP 启动时必须标记为 `FAILED`（如 `RUNNER_RECOVERY_REQUIRED`），不恢复 Runner。
+> MVP 边界：不提供跨进程 Runner 恢复或历史 `RUNNING` 数据修正。本地演示应在同一后端进程内完成一场运行中的讨论。

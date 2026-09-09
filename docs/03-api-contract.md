@@ -51,7 +51,7 @@
 
 ### GET /api/discussions/{discussion_id}
 
-- **用途**：演播厅初始化、刷新、SSE 重连后的权威聚合快照。
+- **用途**：演播厅初始化、刷新和 SSE 每次连接后的权威聚合快照。
 - **Path 参数**：`discussion_id`（UUID）。
 - **Request Body**：无。
 - **Response 200**：
@@ -112,26 +112,26 @@
 - **用途**：订阅一场讨论实时事件。
 - **Path 参数**：`discussion_id`；**Request Body**：无。
 - **Response 200**：`Content-Type: text/event-stream`、`Cache-Control: no-cache`；连接后先发 `discussion.snapshot`。
-- **失败情况**：连接前 `404`；运行中以 `discussion.error` 报告。重连后前端必须 GET 详情同步快照；MVP 不承诺事件回放。
+- **失败情况**：连接前 `404`；运行中以 `discussion.error` 报告。浏览器重连后服务端再次发送完整 snapshot；MVP 不提供事件回放、Last-Event-ID 或事件去重协议。
 
 ## 3. SSE Event Contract
 
-事件格式为 `event: <name>` 与 `data: <JSON>`。每条 data 必含 `event_id` 与 `discussion_id`；客户端只更新该 ID 的局部状态，未知/跨场事件丢弃，按 `event_id` 去重。
+事件格式为 `event: <name>` 与 `data: <JSON>`。每条 data 必含 `discussion_id`；客户端只更新该 ID 的局部状态，未知或跨场事件丢弃。MVP 的每次连接都从完整 snapshot 开始，不定义事件编号、回放或去重协议。
 
 ### discussion.snapshot
 
-首次订阅的完整初始化快照。`discussion` 必须与 `GET /api/discussions/{discussion_id}` 的完整聚合 DTO 完全同构（包含确认字段、Participants、Utterances、Insights、总结字段），不可维护另一套缩减模型。前端首次加载先 GET 详情再连接 SSE；snapshot 仅补充连接期间最新聚合，重连后仍再次 GET 校准。
+每次订阅的完整初始化快照。`discussion` 必须与 `GET /api/discussions/{discussion_id}` 的完整聚合 DTO 完全同构（包含确认字段、Participants、Utterances、Insights、总结字段），不可维护另一套缩减模型。前端连接或重连时以该 snapshot 覆盖本场状态。
 
 ```json
-{"event_id":"evt-0001","discussion_id":"c31f16e4-7bb1-4a37-a21b-d281ce70d9a4","discussion":{"id":"c31f16e4-7bb1-4a37-a21b-d281ce70d9a4","topic":"AI 对教育公平的影响","expert_count":2,"max_public_utterances":15,"status":"RUNNING","cast_confirmed":true,"cast_confirmed_at":"2026-09-09T08:10:08Z","summary":null,"summary_status":"pending","error_code":null,"created_at":"2026-09-09T08:10:00Z","updated_at":"2026-09-09T08:11:10Z","started_at":"2026-09-09T08:10:10Z","finished_at":null,"participants":[{"id":"p-cmod","discussion_id":"c31f16e4-7bb1-4a37-a21b-d281ce70d9a4","role":"moderator","name":"程远","profession":"教育记者","title":"教育科技栏目主编","stance":"先厘清公平的衡量标准","color":"#2563EB","runtime_status":"idle","public_focus":null},{"id":"p-c002","discussion_id":"c31f16e4-7bb1-4a37-a21b-d281ce70d9a4","role":"expert","name":"顾岚","profession":"教育政策研究员","title":"区域教育发展顾问","stance":"优先缩小资源可及性差距","color":"#F59E0B","runtime_status":"preparing","public_focus":"正在回应当前问题"},{"id":"p-c003","discussion_id":"c31f16e4-7bb1-4a37-a21b-d281ce70d9a4","role":"expert","name":"罗川","profession":"学习科学研究者","title":"数字学习项目负责人","stance":"应同时检验学习效果差异","color":"#10B981","runtime_status":"idle","public_focus":null}],"utterances":[],"insights":[]}}
+{"discussion_id":"c31f16e4-7bb1-4a37-a21b-d281ce70d9a4","discussion":{"id":"c31f16e4-7bb1-4a37-a21b-d281ce70d9a4","topic":"AI 对教育公平的影响","expert_count":2,"max_public_utterances":15,"status":"RUNNING","cast_confirmed":true,"cast_confirmed_at":"2026-09-09T08:10:08Z","summary":null,"summary_status":"pending","error_code":null,"created_at":"2026-09-09T08:10:00Z","updated_at":"2026-09-09T08:11:10Z","started_at":"2026-09-09T08:10:10Z","finished_at":null,"participants":[{"id":"p-cmod","discussion_id":"c31f16e4-7bb1-4a37-a21b-d281ce70d9a4","role":"moderator","name":"程远","profession":"教育记者","title":"教育科技栏目主编","stance":"先厘清公平的衡量标准","color":"#2563EB","runtime_status":"idle","public_focus":null},{"id":"p-c002","discussion_id":"c31f16e4-7bb1-4a37-a21b-d281ce70d9a4","role":"expert","name":"顾岚","profession":"教育政策研究员","title":"区域教育发展顾问","stance":"优先缩小资源可及性差距","color":"#F59E0B","runtime_status":"preparing","public_focus":"正在聚焦资源可及性"},{"id":"p-c003","discussion_id":"c31f16e4-7bb1-4a37-a21b-d281ce70d9a4","role":"expert","name":"罗川","profession":"学习科学研究者","title":"数字学习项目负责人","stance":"应同时检验学习效果差异","color":"#10B981","runtime_status":"idle","public_focus":null}],"utterances":[],"insights":[]}}
 ```
 
-前端用其补齐局部状态；GET 详情是首次加载与重连后的校准来源。
+前端以其覆盖本场状态；无需维护事件回放或去重缓存。
 
 ### participant.status.changed
 
 ```json
-{"event_id":"evt-0002","discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","participant":{"id":"p-002","runtime_status":"preparing","public_focus":"正在回应当前问题"},"occurred_at":"2026-09-09T08:01:12Z"}
+{"discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","participant":{"id":"p-002","runtime_status":"preparing","public_focus":"正在聚焦转岗成本"},"occurred_at":"2026-09-09T08:01:12Z"}
 ```
 
 前端按 participant ID 合并状态和 `public_focus`，不渲染未定义隐藏字段。
@@ -139,23 +139,23 @@
 ### utterance.created
 
 ```json
-{"event_id":"evt-0003","discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","utterance":{"id":"u-002","discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","participant_id":"p-002","sequence":2,"content":"若只以节省工时衡量，企业会低估转岗与复训成本。自动化应先从可逆、可衡量的流程开始。","created_at":"2026-09-09T08:01:15Z"}}
+{"discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","utterance":{"id":"u-002","discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","participant_id":"p-002","sequence":2,"content":"若只以节省工时衡量，企业会低估转岗与复训成本。自动化应先从可逆、可衡量的流程开始。","created_at":"2026-09-09T08:01:15Z"}}
 ```
 
-前端按 ID 去重、按 sequence 排列，并从 Participant 映射姓名、职业/Title、颜色。
+前端按 `sequence` 排列，并从 Participant 映射姓名、职业/Title、颜色。
 
 ### insights.updated
 
 ```json
-{"event_id":"evt-0004","discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","insights":[{"id":"i-001","discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","type":"consensus","content":"自动化的评价不应只看短期降本。","active":true,"created_at":"2026-09-09T08:01:16Z","updated_at":"2026-09-09T08:01:16Z"}],"occurred_at":"2026-09-09T08:01:16Z"}
+{"discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","insights":[{"id":"i-001","discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","type":"consensus","content":"自动化的评价不应只看短期降本。","active":true,"created_at":"2026-09-09T08:01:16Z","updated_at":"2026-09-09T08:01:16Z"}],"occurred_at":"2026-09-09T08:01:16Z"}
 ```
 
-前端按 Insight ID upsert，按 `type` 与 `active=true` 分区显示；它是变更集合，不是追加文本。
+该事件携带本场完整活跃集合；前端直接替换 Insights，再按 `type` 分区显示。
 
 ### discussion.finished
 
 ```json
-{"event_id":"evt-0010","discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","status":"FINISHED","summary":"本场讨论的共同判断是：自动化应服务于可衡量的业务价值，并配套员工转岗机制；分歧仍集中在投入节奏。","summary_status":"succeeded","finished_at":"2026-09-09T08:04:00Z"}
+{"discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","status":"FINISHED","summary":"本场讨论的共同判断是：自动化应服务于可衡量的业务价值，并配套员工转岗机制；分歧仍集中在投入节奏。","summary_status":"succeeded","finished_at":"2026-09-09T08:04:00Z"}
 ```
 
 前端写入总结和状态，停止运行中动效；绝不显示模型 JSON 原文。
@@ -163,10 +163,10 @@
 ### discussion.error
 
 ```json
-{"event_id":"evt-0009","discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","final_status":"FAILED","error":{"code":"LLM_RESPONSE_VALIDATION_FAILED","message":"本轮讨论生成失败，系统已停止该讨论。","details":{}},"occurred_at":"2026-09-09T08:03:40Z"}
+{"discussion_id":"d2a4e4d6-252e-4a1d-8bbc-6c8974da7001","final_status":"FAILED","error":{"code":"LLM_RESPONSE_VALIDATION_FAILED","message":"本轮讨论生成失败，系统已停止该讨论。","details":{}},"occurred_at":"2026-09-09T08:03:40Z"}
 ```
 
-该事件只用于不可恢复 Runner/调度/发言失败；服务端必须先持久化 `FAILED` 再发送。前端保留现有内容、展示错误，再 GET 详情同步最终状态。Insight 提炼失败不发该事件、不改变 `RUNNING`。
+该事件只用于不可恢复 Runner/模型选择/发言失败；服务端必须先持久化 `FAILED` 再发送。前端保留现有内容并展示错误。Insight 提炼失败不发该事件、不改变 `RUNNING`。
 
 ## 4. API 与领域模型对应关系
 
