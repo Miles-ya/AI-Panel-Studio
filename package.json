@@ -1,0 +1,11 @@
+{
+  "name": "ai-panel-studio",
+  "private": true,
+  "workspaces": ["frontend"],
+  "scripts": {
+    "e2e:list": "playwright test --list"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.57.0"
+  }
+}

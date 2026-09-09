@@ -1,0 +1,19 @@
+[project]
+name = "ai-panel-studio-backend"
+version = "0.1.0"
+description = "AI Panel Studio MVP backend scaffold"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "pydantic>=2.9,<3.0",
+  "SQLAlchemy>=2.0,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,5 +1,8 @@
 # Dependencies
 node_modules/
+backend/.venv/
+__pycache__/
+.pytest_cache/
 dist/
 build/
 .next/
@@ -25,4 +28,3 @@ test-results/
 .DS_Store
 .idea/
 .vscode/
-
