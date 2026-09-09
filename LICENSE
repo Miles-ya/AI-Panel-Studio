@@ -1,0 +1,34 @@
+# Evaluation Only License
+
+Copyright (c) 2026 Miles-ya. All rights reserved.
+
+This software and its accompanying source code, documentation, designs,
+prompts, data models, and other materials are provided solely for recruitment
+and technical evaluation purposes.
+
+Permission is granted to the recipient to:
+
+- View and inspect the source code and documentation;
+- Clone or download the repository solely for evaluation;
+- Run and test the software solely for recruitment or technical assessment;
+- Review the architecture, implementation, prompts, tests, and development process.
+
+No permission is granted to:
+
+- Use the software or any substantial portion of it in any commercial product or service;
+- Use the software for internal production or business operations;
+- Copy, modify, adapt, or create derivative works for purposes other than evaluation;
+- Redistribute, sublicense, publish, sell, or commercially exploit the software;
+- Incorporate the source code, architecture, prompts, product design, or other project materials into another product or project;
+- Continue development of this project or substantially similar implementations based on this source code for commercial purposes without prior written permission from the copyright holder.
+
+All rights not expressly granted above are reserved by the copyright holder.
+
+This license applies only to original materials created for this project.
+Third-party libraries, frameworks, and other dependencies remain subject to
+their respective licenses.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+For any use beyond recruitment or technical evaluation, separate written
+permission from the copyright holder is required.

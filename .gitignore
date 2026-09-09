@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+dist/
+build/
+.next/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local data
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Logs and test output
+*.log
+coverage/
+playwright-report/
+test-results/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
