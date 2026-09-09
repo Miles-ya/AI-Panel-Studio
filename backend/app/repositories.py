@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from sqlalchemy import func, select
+from datetime import UTC, datetime
+from uuid import uuid4
+
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from app.llm import CastOutput
 from app.models import Discussion, Participant
 
 
@@ -44,5 +48,34 @@ class DiscussionRepository:
 
     def save(self, discussion: Discussion) -> Discussion:
         self.session.commit()
+        self.session.refresh(discussion)
+        return discussion
+
+    def replace_cast(self, discussion_id: str, cast: CastOutput) -> Discussion:
+        with self.session.begin():
+            discussion = self.session.get(Discussion, discussion_id)
+            if discussion is None:
+                raise LookupError(discussion_id)
+            now = datetime.now(UTC)
+            self.session.execute(delete(Participant).where(Participant.discussion_id == discussion_id))
+            self.session.add_all(
+                Participant(
+                    id=str(uuid4()),
+                    discussion_id=discussion_id,
+                    role=candidate.role,
+                    name=candidate.name,
+                    profession=candidate.profession,
+                    title=candidate.title,
+                    stance=candidate.stance,
+                    color=candidate.color,
+                    runtime_status="idle",
+                    created_at=now,
+                )
+                for candidate in cast.participants
+            )
+            discussion.status = "CAST_READY"
+            discussion.cast_confirmed = False
+            discussion.cast_confirmed_at = None
+            discussion.updated_at = now
         self.session.refresh(discussion)
         return discussion

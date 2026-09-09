@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.database import create_sqlite_engine, initialize_database
 from app.domain import DiscussionRuleViolation
+from app.llm import CastOutputValidationError, LLMProviderError
 from app.repositories import DiscussionRepository
 from app.schemas import (
     ConfirmationDto,
@@ -52,6 +53,16 @@ async def discussion_rule_violation_handler(_: Request, error: DiscussionRuleVio
 @app.exception_handler(DiscussionNotFound)
 async def discussion_not_found_handler(_: Request, __: DiscussionNotFound) -> JSONResponse:
     return _error_response(404, "DISCUSSION_NOT_FOUND", "未找到指定的讨论。")
+
+
+@app.exception_handler(CastOutputValidationError)
+async def cast_output_validation_handler(_: Request, __: CastOutputValidationError) -> JSONResponse:
+    return _error_response(502, "LLM_RESPONSE_VALIDATION_FAILED", "阵容生成结果不合法。")
+
+
+@app.exception_handler(LLMProviderError)
+async def llm_provider_error_handler(_: Request, __: LLMProviderError) -> JSONResponse:
+    return _error_response(503, "LLM_PROVIDER_UNAVAILABLE", "阵容生成服务暂不可用。")
 
 
 def _session_factory() -> sessionmaker[Session]:
@@ -111,6 +122,14 @@ async def get_discussion(
     service: DiscussionService = Depends(get_discussion_service),
 ) -> Discussion:
     return service.get(discussion_id)
+
+
+@app.post("/api/discussions/{discussion_id}/generate-cast", response_model=DiscussionDto)
+async def generate_cast(
+    discussion_id: str,
+    service: DiscussionService = Depends(get_discussion_service),
+) -> Discussion:
+    return service.generate_cast(discussion_id)
 
 
 @app.post("/api/discussions/{discussion_id}/confirm", response_model=ConfirmationDto)

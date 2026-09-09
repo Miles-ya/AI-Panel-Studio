@@ -5,6 +5,13 @@ from uuid import uuid4
 
 from app.domain import Discussion as DiscussionAggregate
 from app.domain import DiscussionRuleViolation
+from app.llm import (
+    CastOutput,
+    CastOutputValidationError,
+    DeepSeekLLMProvider,
+    LLMProvider,
+    LLMProviderError,
+)
 from app.models import Discussion
 from app.repositories import DiscussionRepository
 
@@ -14,8 +21,9 @@ class DiscussionNotFound(Exception):
 
 
 class DiscussionService:
-    def __init__(self, repository: DiscussionRepository) -> None:
+    def __init__(self, repository: DiscussionRepository, llm_provider: LLMProvider | None = None) -> None:
         self.repository = repository
+        self.llm_provider = llm_provider or DeepSeekLLMProvider()
 
     def create(self, topic: str, expert_count: int | None) -> Discussion:
         aggregate = DiscussionAggregate.create(
@@ -65,6 +73,43 @@ class DiscussionService:
         discussion.started_at = datetime.now(UTC)
         discussion.updated_at = discussion.started_at
         return self.repository.save(discussion)
+
+    def generate_cast(self, discussion_id: str) -> Discussion:
+        discussion = self.get(discussion_id)
+        if discussion.status not in {"DRAFT", "CAST_READY"}:
+            raise DiscussionRuleViolation(
+                "DISCUSSION_STATE_CONFLICT",
+                "当前讨论状态不允许生成阵容。",
+                details={"current_status": discussion.status, "required_statuses": ["DRAFT", "CAST_READY"]},
+            )
+        topic, expert_count = discussion.topic, discussion.expert_count
+        self.repository.session.rollback()
+        cast = self._generate_valid_cast(topic, expert_count)
+        return self.repository.replace_cast(discussion_id, cast)
+
+    def _generate_valid_cast(self, topic: str, expert_count: int) -> CastOutput:
+        try:
+            candidate = CastOutput.from_provider_response(
+                self._request_cast(topic, expert_count)
+            )
+            candidate.validate_for(expert_count)
+            return candidate
+        except CastOutputValidationError as first_error:
+            corrected = CastOutput.from_provider_response(
+                self._request_cast(topic, expert_count, correction=first_error.correction)
+            )
+            corrected.validate_for(expert_count)
+            return corrected
+
+    def _request_cast(
+        self, topic: str, expert_count: int, correction: str | None = None
+    ) -> CastOutput | list[dict[str, str]]:
+        try:
+            return self.llm_provider.generate_cast(topic, expert_count, correction=correction)
+        except LLMProviderError:
+            raise
+        except Exception as error:
+            raise LLMProviderError("Cast provider failed.") from error
 
     @staticmethod
     def _aggregate(discussion: Discussion) -> DiscussionAggregate:

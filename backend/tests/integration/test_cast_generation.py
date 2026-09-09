@@ -25,8 +25,10 @@ class ScriptedFakeLLMProvider:
         self._responses = iter(responses)
         self.generate_cast_calls = 0
 
-    def generate_cast(self, topic: str, expert_count: int) -> list[dict[str, str]]:
-        del topic, expert_count
+    def generate_cast(
+        self, topic: str, expert_count: int, correction: str | None = None
+    ) -> list[dict[str, str]]:
+        del topic, expert_count, correction
         self.generate_cast_calls += 1
         response = next(self._responses)
         if isinstance(response, Exception):
