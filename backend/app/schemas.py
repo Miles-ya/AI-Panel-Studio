@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from enum import Enum
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
 class ContractModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
 
 
 class DiscussionStatus(str, Enum):
@@ -64,3 +65,35 @@ class DiscussionDto(ContractModel):
     max_public_utterances: int
     status: DiscussionStatus
     cast_confirmed: bool
+
+
+class CreateDiscussionRequest(ContractModel):
+    topic: str
+    expert_count: int | None = None
+
+
+class DiscussionListItemDto(ContractModel):
+    id: str
+    topic: str
+    expert_count: int
+    status: DiscussionStatus
+    participant_count: int
+    updated_at: datetime
+
+
+class DiscussionListResponse(ContractModel):
+    items: list[DiscussionListItemDto]
+
+
+class ConfirmationDto(ContractModel):
+    id: str
+    status: DiscussionStatus
+    cast_confirmed: bool
+    cast_confirmed_at: datetime | None
+    studio_path: str
+
+
+class StartDiscussionDto(ContractModel):
+    id: str
+    status: DiscussionStatus
+    started_at: datetime | None
