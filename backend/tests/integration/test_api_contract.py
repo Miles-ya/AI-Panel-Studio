@@ -1,17 +1,60 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import Engine
+from sqlalchemy.orm import Session, sessionmaker
 
+from app.database import create_sqlite_engine, initialize_database
 from app.main import app
+from app.models import Discussion
 
 
 @pytest.fixture()
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture(autouse=True)
+def database_engine(tmp_path: Path) -> AsyncIterator[Engine]:
+    engine = create_sqlite_engine(f"sqlite:///{tmp_path / 'api-contract.db'}")
+    initialize_database(engine, seed=False)
+    app.state.session_factory = sessionmaker(bind=engine)
+    try:
+        yield engine
+    finally:
+        del app.state.session_factory
+        engine.dispose()
+
+
+@pytest.fixture()
+def draft_discussion_id(database_engine: Engine) -> str:
+    discussion_id = str(uuid4())
+    now = datetime.now(UTC)
+
+    with Session(database_engine) as session:
+        session.add(
+            Discussion(
+                id=discussion_id,
+                topic="讨论 AI 治理的边界",
+                expert_count=4,
+                max_public_utterances=15,
+                status="DRAFT",
+                cast_confirmed=False,
+                summary_status="pending",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+
+    return discussion_id
 
 
 @pytest.fixture()
@@ -78,8 +121,9 @@ async def test_when_creating_discussion_outside_expert_range_then_api_returns_er
 @pytest.mark.anyio
 async def test_when_confirming_draft_then_api_returns_state_conflict_error_dto(
     client: AsyncClient,
+    draft_discussion_id: str,
 ) -> None:
-    response = await client.post("/api/discussions/discussion-in-draft/confirm", json={})
+    response = await client.post(f"/api/discussions/{draft_discussion_id}/confirm", json={})
 
     assert response.status_code == 409
     _assert_error_shape(response.json(), code="DISCUSSION_STATE_CONFLICT")
@@ -88,8 +132,9 @@ async def test_when_confirming_draft_then_api_returns_state_conflict_error_dto(
 @pytest.mark.anyio
 async def test_when_starting_draft_then_api_returns_documented_state_conflict_details(
     client: AsyncClient,
+    draft_discussion_id: str,
 ) -> None:
-    response = await client.post("/api/discussions/discussion-in-draft/start", json={})
+    response = await client.post(f"/api/discussions/{draft_discussion_id}/start", json={})
 
     assert response.status_code == 409
     error = _assert_error_shape(response.json(), code="DISCUSSION_STATE_CONFLICT")
@@ -97,3 +142,23 @@ async def test_when_starting_draft_then_api_returns_documented_state_conflict_de
         "current_status": "DRAFT",
         "required_status": "CAST_READY",
     }
+
+
+@pytest.mark.anyio
+async def test_when_confirming_unknown_discussion_then_api_returns_not_found_error_dto(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(f"/api/discussions/{uuid4()}/confirm", json={})
+
+    assert response.status_code == 404
+    _assert_error_shape(response.json(), code="DISCUSSION_NOT_FOUND")
+
+
+@pytest.mark.anyio
+async def test_when_starting_unknown_discussion_then_api_returns_not_found_error_dto(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(f"/api/discussions/{uuid4()}/start", json={})
+
+    assert response.status_code == 404
+    _assert_error_shape(response.json(), code="DISCUSSION_NOT_FOUND")
