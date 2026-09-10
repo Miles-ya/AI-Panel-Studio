@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -13,7 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.database import create_sqlite_engine, initialize_database
 from app.domain import DiscussionRuleViolation
-from app.llm import CastOutputValidationError, DeepSeekLLMProvider, LLMProviderError
+from app.llm import CastOutputValidationError, DeepSeekLLMProvider, DemoLLMProvider, LLMProviderError
 from app.repositories import DiscussionRepository
 from app.runtime import DiscussionRunner, EventHub, RunnerRegistry
 from app.schemas import (
@@ -32,6 +33,12 @@ from app.services import DiscussionNotFound, DiscussionService
 
 
 app = FastAPI(title="AI Panel Studio", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _error_response(status_code: int, code: str, message: str, details: dict[str, Any] | None = None) -> JSONResponse:
@@ -98,11 +105,22 @@ def _runner_registry() -> RunnerRegistry:
     return registry
 
 
+def _llm_provider() -> DeepSeekLLMProvider | DemoLLMProvider:
+    provider = getattr(app.state, "llm_provider", None)
+    if provider is None:
+        if os.getenv("LLM_PROVIDER", "deepseek").lower() == "fake":
+            provider = DemoLLMProvider(summary_mode=os.getenv("FAKE_LLM_SUMMARY_MODE", "success"))
+        else:
+            provider = DeepSeekLLMProvider()
+        app.state.llm_provider = provider
+    return provider
+
+
 def _new_runner(discussion_id: str) -> DiscussionRunner:
     return DiscussionRunner(
         discussion_id=discussion_id,
         session_factory=_session_factory(),
-        llm_provider=DeepSeekLLMProvider(),
+        llm_provider=_llm_provider(),
         event_hub=_event_hub(),
     )
 
@@ -131,7 +149,7 @@ async def get_session() -> AsyncGenerator[Session, None]:
 
 
 async def get_discussion_service(session: Session = Depends(get_session)) -> DiscussionService:
-    return DiscussionService(DiscussionRepository(session))
+    return DiscussionService(DiscussionRepository(session), llm_provider=_llm_provider())
 
 
 @app.post("/api/discussions", response_model=DiscussionDto, status_code=201)

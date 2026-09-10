@@ -282,6 +282,79 @@ class FakeLLMProvider:
         return response
 
 
+class DemoLLMProvider:
+    """A deterministic, discussion-isolated provider for local browser smoke tests."""
+
+    def __init__(self, *, summary_mode: str = "success") -> None:
+        self.summary_mode = summary_mode
+        self._summary_attempts: dict[str, int] = {}
+
+    def generate_cast(
+        self, topic: str, expert_count: int, correction: str | None = None
+    ) -> CastOutput:
+        del correction
+        palette = ["#2563EB", "#F59E0B", "#10B981", "#EC4899", "#8B5CF6", "#0891B2", "#EA580C", "#4F46E5", "#65A30D"]
+        participants = [
+            CastMemberOutput(
+                role="moderator",
+                name="林澄",
+                profession="科技记者",
+                title="圆桌主持人",
+                stance=f"围绕{topic}厘清可验证的行动。",
+                color=palette[0],
+            )
+        ]
+        stances = ["优先衡量业务价值", "先设定治理边界", "同步规划人才转岗", "从可逆流程试点", "关注长期公共影响", "建立可审计指标", "控制实施风险", "检验用户实际收益"]
+        for index in range(expert_count):
+            participants.append(
+                CastMemberOutput(
+                    role="expert",
+                    name=f"专家{index + 1}",
+                    profession="策略顾问",
+                    title=f"议题研究员 {index + 1}",
+                    stance=stances[index],
+                    color=palette[index + 1],
+                )
+            )
+        return CastOutput(participants=participants)
+
+    def select_next_speaker(
+        self, input: SpeakerSelectionInput, correction: str | None = None
+    ) -> SpeakerSelectionOutput:
+        del correction
+        if input.public_utterance_count == 0:
+            participant = next(item for item in input.participants if item.role == "moderator")
+        else:
+            candidates = [item for item in input.participants if str(item.id) != str(input.previous_speaker_id)]
+            participant = candidates[input.public_utterance_count % len(candidates)]
+        return SpeakerSelectionOutput(participant_id=participant.id, public_focus="正在提出可验证的下一步")
+
+    def generate_turn(
+        self, input: TurnGenerationInput, correction: str | None = None
+    ) -> TurnOutput:
+        del correction
+        turn_number = len(input.transcript) + 1
+        return TurnOutput(
+            content=f"这是第 {turn_number} 条公开观点：应把分歧转化为可验证的行动。",
+            should_end=turn_number >= 3,
+        )
+
+    def extract_insights(self, saved: Mapping[str, object], _: object) -> dict[str, list[str]]:
+        sequence = int(saved["sequence"])
+        return {
+            "consensus": ["下一步应当可验证。"],
+            "disagreement": ["投入节奏是否应当一次性确定？"] if sequence > 1 else [],
+        }
+
+    def summarize(self, transcript: Sequence[Any]) -> str | None:
+        discussion_id = str(transcript[0].discussion_id) if transcript else "empty"
+        attempts = self._summary_attempts.get(discussion_id, 0)
+        self._summary_attempts[discussion_id] = attempts + 1
+        if self.summary_mode == "fallback_once" and attempts == 0:
+            return None
+        return "讨论已收束：应以可验证的行动作为下一步。"
+
+
 class DeepSeekLLMProvider:
     def __init__(
         self,
