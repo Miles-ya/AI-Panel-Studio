@@ -200,7 +200,7 @@ class SpeakerSelectionOutput(BaseModel):
 class TurnOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    content: str = Field(min_length=1, max_length=500)
+    content: str = Field(min_length=1, max_length=300)
     should_end: StrictBool
 
     @field_validator("content", mode="before")
@@ -461,7 +461,7 @@ class DeepSeekLLMProvider:
     def generate_turn(
         self, input: TurnGenerationInput, correction: str | None = None
     ) -> Mapping[str, object]:
-        closing_instruction = "Write a 300-500 Chinese-character moderator closing summary covering conclusions, remaining disagreements, and next steps." if input.closing else "Write 1-2 public sentences."
+        closing_instruction = "Write a 180-280 Chinese-character moderator closing summary covering conclusions, remaining disagreements, and next steps." if input.closing else "Write 1-2 public sentences."
         prompt = {
             "discussion_id": str(input.discussion_id),
             "participants": [person.model_dump(mode="json") for person in input.participants],
@@ -469,7 +469,7 @@ class DeepSeekLLMProvider:
             "active_insights": [item.model_dump(mode="json") for item in input.active_insights],
             "selected_participant": input.selected_participant.model_dump(mode="json"),
             "closing": input.closing,
-            "required_schema": {"content": "300-500 Chinese characters, no line breaks" if input.closing else "1-2 public sentences, no line breaks, max 300 characters", "should_end": "boolean"},
+            "required_schema": {"content": "180-280 Chinese characters, no line breaks, max 300 characters" if input.closing else "1-2 public sentences, no line breaks, max 300 characters", "should_end": "boolean"},
         }
         if correction is not None:
             prompt["correction"] = correction
@@ -482,7 +482,7 @@ class DeepSeekLLMProvider:
     async def async_generate_turn(
         self, input: TurnGenerationInput, correction: str | None = None
     ) -> Mapping[str, object]:
-        closing_instruction = "Write a 300-500 Chinese-character moderator closing summary covering conclusions, remaining disagreements, and next steps." if input.closing else "Write 1-2 public sentences."
+        closing_instruction = "Write a 180-280 Chinese-character moderator closing summary covering conclusions, remaining disagreements, and next steps." if input.closing else "Write 1-2 public sentences."
         prompt = {
             "discussion_id": str(input.discussion_id),
             "participants": [person.model_dump(mode="json") for person in input.participants],
@@ -490,7 +490,7 @@ class DeepSeekLLMProvider:
             "active_insights": [item.model_dump(mode="json") for item in input.active_insights],
             "selected_participant": input.selected_participant.model_dump(mode="json"),
             "closing": input.closing,
-            "required_schema": {"content": "300-500 Chinese characters, no line breaks" if input.closing else "1-2 public sentences, no line breaks, max 300 characters", "should_end": "boolean"},
+            "required_schema": {"content": "180-280 Chinese characters, no line breaks, max 300 characters" if input.closing else "1-2 public sentences, no line breaks, max 300 characters", "should_end": "boolean"},
         }
         if correction is not None:
             prompt["correction"] = correction
@@ -525,6 +525,21 @@ class DeepSeekLLMProvider:
             error_message="DeepSeek summary generation failed.",
         )
         return self._summary_from_response(response)
+
+    async def async_finalize_insights(
+        self, transcript: Sequence[PublicUtterance]
+    ) -> Mapping[str, object]:
+        return await self._request_json_async(
+            {
+                "transcript": [item.model_dump(mode="json") for item in transcript],
+                "required_schema": {
+                    "consensus": "0-2 concise Chinese consensus statements, each max 120 characters",
+                    "disagreement": "0-2 concise Chinese disagreement statements, each max 120 characters",
+                },
+            },
+            system_message="Return only JSON with independently generated consensus and disagreement lists for this completed discussion. Do not include a summary, reasoning, or hidden analysis.",
+            error_message="DeepSeek final insights generation failed.",
+        )
 
     @staticmethod
     def _summary_from_response(response: Mapping[str, object]) -> str:

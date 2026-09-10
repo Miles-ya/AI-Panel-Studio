@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import json
+import logging
+from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any
 
@@ -17,7 +19,7 @@ from app.domain import DiscussionRuleViolation
 from app.environment import load_local_environment
 from app.llm import CastOutputValidationError, DeepSeekLLMProvider, DemoLLMProvider, LLMProviderError
 from app.repositories import DiscussionRepository
-from app.runtime import DiscussionRunner, EventHub, RunnerRegistry
+from app.runtime import DiscussionRunner, EventHub, RunnerRegistry, SummaryGenerationService, SummaryTaskRegistry
 from app.schemas import (
     ConfirmationDto,
     CreateDiscussionRequest,
@@ -34,8 +36,18 @@ from app.services import DiscussionNotFound, DiscussionService
 
 
 load_local_environment()
+logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AI Panel Studio", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    recovered = _summary_service().recover_interrupted()
+    if recovered:
+        logger.warning("summary_tasks_recovered count=%s", recovered)
+    yield
+
+
+app = FastAPI(title="AI Panel Studio", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"https?://(?:127\.0\.0\.1|localhost):\d+",
@@ -108,6 +120,39 @@ def _runner_registry() -> RunnerRegistry:
     return registry
 
 
+def _summary_service() -> SummaryGenerationService:
+    service = getattr(app.state, "summary_service", None)
+    if service is None:
+        service = SummaryGenerationService(
+            session_factory=_session_factory(),
+            llm_provider=_llm_provider(),
+            event_hub=_event_hub(),
+        )
+        app.state.summary_service = service
+    return service
+
+
+def _summary_task_registry() -> SummaryTaskRegistry:
+    registry = getattr(app.state, "summary_task_registry", None)
+    if registry is None:
+        registry = SummaryTaskRegistry()
+        app.state.summary_task_registry = registry
+    return registry
+
+
+async def _schedule_summary(discussion_id: str) -> None:
+    service = _summary_service()
+    try:
+        await _summary_task_registry().start(discussion_id, service.generate)
+    except Exception as error:
+        logger.warning(
+            "summary_task_start_failed discussion_id=%s error_type=%s",
+            discussion_id,
+            type(error).__name__,
+        )
+        await service.mark_fallback(discussion_id)
+
+
 def _llm_provider() -> DeepSeekLLMProvider | DemoLLMProvider:
     provider = getattr(app.state, "llm_provider", None)
     if provider is None:
@@ -125,6 +170,8 @@ def _new_runner(discussion_id: str) -> DiscussionRunner:
         session_factory=_session_factory(),
         llm_provider=_llm_provider(),
         event_hub=_event_hub(),
+        summary_service=_summary_service(),
+        schedule_summary=_schedule_summary,
     )
 
 
@@ -258,9 +305,8 @@ async def retry_summary(
     discussion = service.get(discussion_id)
     if discussion.status != "FINISHED" or discussion.summary_status != "fallback":
         raise DiscussionRuleViolation("DISCUSSION_STATE_CONFLICT", "当前讨论无法重试总结。")
-    runner = _runner_registry().get(discussion_id) or _new_runner(discussion_id)
-    import asyncio
-    asyncio.create_task(runner.retry_summary())
+    await _summary_service().begin_retry(discussion_id)
+    await _schedule_summary(discussion_id)
     return RetrySummaryDto(id=discussion.id, status=discussion.status, summary_status="pending", retry_requested=True)
 
 

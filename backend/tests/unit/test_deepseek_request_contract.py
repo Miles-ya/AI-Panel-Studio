@@ -1,3 +1,4 @@
+import asyncio
 from uuid import UUID
 
 import httpx
@@ -194,7 +195,7 @@ def test_speaker_selection_instructs_the_model_not_to_follow_seat_order(monkeypa
     assert "不要按嘉宾列表、座位或轮流顺序选择发言人" in request_prompt
 
 
-def test_closing_turn_requests_a_detailed_moderator_summary(monkeypatch) -> None:
+def test_closing_turn_requests_a_moderator_summary_within_the_persisted_limit(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class Response:
@@ -209,4 +210,42 @@ def test_closing_turn_requests_a_detailed_moderator_summary(monkeypatch) -> None
     participant = PublicParticipant(id=UUID("11111111-1111-1111-1111-111111111111"), discussion_id=UUID("22222222-2222-2222-2222-222222222222"), role="moderator", name="主持人", profession="记者", title="主持人", stance="收束")
     DeepSeekLLMProvider(api_key="test-key").generate_turn(TurnGenerationInput(discussion_id=participant.discussion_id, participants=[participant], selected_participant=participant, closing=True))
 
-    assert "300-500" in captured["json"]["messages"][0]["content"]
+    assert "180-280" in captured["json"]["messages"][0]["content"]
+    assert "max 300 characters" in captured["json"]["messages"][1]["content"]
+
+
+def test_final_insights_request_is_separate_from_the_summary(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"message": {"content": '{"consensus":["最终共识"],"disagreement":["最终分歧"]}'}}]}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def post(self, *_, **kwargs):
+            captured.update(kwargs)
+            return Response()
+
+    monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **_: Client())
+    result = asyncio.run(
+        DeepSeekLLMProvider(api_key="test-key").async_finalize_insights(
+            [
+                PublicUtterance(
+                    participant_id=UUID("11111111-1111-1111-1111-111111111111"),
+                    content="公开观点。",
+                )
+            ]
+        )
+    )
+
+    assert result == {"consensus": ["最终共识"], "disagreement": ["最终分歧"]}
+    assert "independently generated consensus" in captured["json"]["messages"][0]["content"]

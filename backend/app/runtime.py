@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping
+import logging
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -14,6 +15,7 @@ from app.llm import (
     PublicUtterance,
     SpeakerSelectionInput,
     TurnGenerationInput,
+    TurnOutput,
 )
 from app.models import Discussion, Participant, Utterance
 from app.repositories import (
@@ -23,6 +25,10 @@ from app.repositories import (
     UtteranceRepository,
 )
 from app.services import SpeakerSelector, TurnGenerator
+
+
+logger = logging.getLogger(__name__)
+SUMMARY_UNAVAILABLE = "总结暂不可用"
 
 
 class _EventSubscription(AsyncIterator[dict[str, Any]]):
@@ -61,6 +67,127 @@ class EventHub:
             self._subscribers.pop(discussion_id, None)
 
 
+class SummaryGenerationService:
+    def __init__(
+        self,
+        *,
+        session_factory: sessionmaker[Session],
+        llm_provider: Any,
+        event_hub: EventHub,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self.session_factory = session_factory
+        self.llm_provider = llm_provider
+        self.event_hub = event_hub
+        self.clock = clock or (lambda: datetime.now(UTC))
+
+    async def begin_retry(self, discussion_id: str) -> None:
+        with self.session_factory() as session:
+            discussion = DiscussionRepository(session).get(discussion_id)
+            if discussion is None or discussion.status != "FINISHED" or discussion.summary_status != "fallback":
+                raise ValueError("summary retry is only available for finished fallback discussions")
+            discussion.summary = None
+            discussion.summary_status = "pending"
+            discussion.updated_at = self.clock()
+            DiscussionRepository(session).save(discussion)
+
+    async def generate(self, discussion_id: str) -> None:
+        summary = await self._request_summary(discussion_id)
+        if summary is None:
+            await self.mark_fallback(discussion_id)
+        else:
+            await self._complete(discussion_id, summary)
+
+    async def mark_fallback(self, discussion_id: str) -> None:
+        await self._complete(discussion_id, None)
+
+    async def _complete(self, discussion_id: str, summary: str | None) -> None:
+        with self.session_factory() as session:
+            discussion = DiscussionRepository(session).get(discussion_id)
+            if discussion is None or discussion.status != "FINISHED" or discussion.summary_status != "pending":
+                return
+            discussion.summary = summary or SUMMARY_UNAVAILABLE
+            discussion.summary_status = "succeeded" if summary is not None else "fallback"
+            discussion.updated_at = self.clock()
+            DiscussionRepository(session).save(discussion)
+            payload = {
+                "status": discussion.status,
+                "summary": discussion.summary,
+                "summary_status": discussion.summary_status,
+                "finished_at": discussion.finished_at,
+            }
+        await self.event_hub.publish({"type": "discussion.finished", "discussion_id": discussion_id, **payload})
+
+    def recover_interrupted(self) -> int:
+        with self.session_factory() as session:
+            discussions = DiscussionRepository(session).list_finished_with_pending_summary()
+            for discussion in discussions:
+                discussion.summary = SUMMARY_UNAVAILABLE
+                discussion.summary_status = "fallback"
+                discussion.updated_at = self.clock()
+            if discussions:
+                session.commit()
+            return len(discussions)
+
+    async def _request_summary(self, discussion_id: str) -> str | None:
+        async_summarizer = getattr(self.llm_provider, "async_summarize", None)
+        summarizer = getattr(self.llm_provider, "summarize", None)
+        if not callable(async_summarizer) and not callable(summarizer):
+            return None
+        with self.session_factory() as session:
+            transcript = [
+                PublicUtterance.model_validate(item)
+                for item in UtteranceRepository(session).list_for_discussion(discussion_id)
+            ]
+        for attempt in range(1, 3):
+            try:
+                summary = await async_summarizer(transcript) if callable(async_summarizer) else summarizer(transcript)
+            except Exception as error:
+                logger.warning(
+                    "summary_generation_failed discussion_id=%s attempt=%s reason=request_error error_type=%s",
+                    discussion_id,
+                    attempt,
+                    type(error).__name__,
+                )
+                continue
+            if not isinstance(summary, str) or not summary.strip():
+                logger.warning(
+                    "summary_generation_failed discussion_id=%s attempt=%s reason=empty_response",
+                    discussion_id,
+                    attempt,
+                )
+                continue
+            if summary.strip() == SUMMARY_UNAVAILABLE:
+                logger.warning(
+                    "summary_generation_failed discussion_id=%s attempt=%s reason=unavailable_placeholder",
+                    discussion_id,
+                    attempt,
+                )
+                continue
+            return summary.strip()
+        return None
+
+
+class SummaryTaskRegistry:
+    def __init__(self) -> None:
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    async def start(self, discussion_id: str, generate: Callable[[str], Awaitable[None]]) -> None:
+        lock = self._locks.setdefault(discussion_id, asyncio.Lock())
+        async with lock:
+            current = self._tasks.get(discussion_id)
+            if current is not None and not current.done():
+                raise RuntimeError("summary task already started")
+            task = asyncio.create_task(generate(discussion_id))
+            self._tasks[discussion_id] = task
+
+    async def wait(self, discussion_id: str) -> None:
+        task = self._tasks.get(discussion_id)
+        if task is not None:
+            await task
+
+
 class DiscussionRunner:
     def __init__(
         self,
@@ -69,6 +196,8 @@ class DiscussionRunner:
         session_factory: sessionmaker[Session],
         llm_provider: Any,
         event_hub: EventHub,
+        summary_service: SummaryGenerationService | None = None,
+        schedule_summary: Callable[[str], Awaitable[None]] | None = None,
         stop_event: asyncio.Event | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -81,6 +210,13 @@ class DiscussionRunner:
         self._previous_speaker_id: str | None = None
         self._closing_requested = False
         self._task: asyncio.Task[None] | None = None
+        self.summary_service = summary_service or SummaryGenerationService(
+            session_factory=session_factory,
+            llm_provider=llm_provider,
+            event_hub=event_hub,
+            clock=self.clock,
+        )
+        self.schedule_summary = schedule_summary or self.summary_service.generate
 
     @property
     def status(self) -> str:
@@ -150,12 +286,21 @@ class DiscussionRunner:
                 stop_requested=self.stop_event.is_set(),
             )
             selector = SpeakerSelector(self.llm_provider)
-            if callable(getattr(self.llm_provider, "async_select_next_speaker", None)):
-                selection = await selector.select_next_speaker_async(selection_input)
-            else:
-                selection = selector.select_next_speaker(selection_input)
-            selected = next(person for person in public_participants if str(person.id) == str(selection.participant_id))
-            public_focus = selection.public_focus
+            try:
+                if callable(getattr(self.llm_provider, "async_select_next_speaker", None)):
+                    selection = await selector.select_next_speaker_async(selection_input)
+                else:
+                    selection = selector.select_next_speaker(selection_input)
+                selected = next(person for person in public_participants if str(person.id) == str(selection.participant_id))
+                public_focus = selection.public_focus
+            except Exception as error:
+                logger.warning(
+                    "speaker_selection_failed discussion_id=%s error_type=%s",
+                    self.discussion_id,
+                    type(error).__name__,
+                )
+                selected = self._fallback_speaker(public_participants, len(transcript))
+                public_focus = "继续回应当前讨论"
 
         await self._set_participant_status(str(selected.id), "preparing", public_focus)
         await self._set_participant_status(str(selected.id), "speaking", public_focus)
@@ -169,10 +314,22 @@ class DiscussionRunner:
             closing=closing,
         )
         generator = TurnGenerator(self.llm_provider)
-        if callable(getattr(self.llm_provider, "async_generate_turn", None)):
-            turn = await generator.generate_turn_async(turn_input)
-        else:
-            turn = generator.generate_turn(turn_input)
+        try:
+            if callable(getattr(self.llm_provider, "async_generate_turn", None)):
+                turn = await generator.generate_turn_async(turn_input)
+            else:
+                turn = generator.generate_turn(turn_input)
+        except Exception as error:
+            logger.warning(
+                "turn_generation_failed discussion_id=%s closing=%s error_type=%s",
+                self.discussion_id,
+                closing,
+                type(error).__name__,
+            )
+            turn = TurnOutput(
+                content=self._closing_fallback(public_insights) if closing else self._turn_fallback(selected),
+                should_end=closing,
+            )
         saved = self._save_utterance(str(selected.id), turn.content)
         await self.event_hub.publish(
             {
@@ -220,37 +377,12 @@ class DiscussionRunner:
         await self._set_participant_status(str(selected.id), "idle", None)
         self._previous_speaker_id = str(selected.id)
         if closing or (turn.should_end and selected.role == "moderator"):
-            await self._finish(summary=turn.content)
+            await self._finish()
         elif turn.should_end:
             self._closing_requested = True
         elif self.stop_event.is_set() or self._utterance_count() >= 15:
             await self._finish()
         return True
-
-    async def retry_summary(self) -> None:
-        with self.session_factory() as session:
-            discussion = DiscussionRepository(session).get(self.discussion_id)
-            if discussion is None or discussion.status != "FINISHED" or discussion.summary_status != "fallback":
-                raise ValueError("summary retry is only available for finished fallback discussions")
-        summary = await self._request_summary()
-        with self.session_factory() as session:
-            discussion = DiscussionRepository(session).get(self.discussion_id)
-            if discussion is None:
-                return
-            if summary is not None:
-                discussion.summary = summary
-                discussion.summary_status = "succeeded"
-                discussion.updated_at = self.clock()
-                DiscussionRepository(session).save(discussion)
-            event = {
-                "type": "discussion.finished",
-                "discussion_id": self.discussion_id,
-                "status": discussion.status,
-                "summary": discussion.summary,
-                "summary_status": discussion.summary_status,
-                "finished_at": discussion.finished_at,
-            }
-        await self.event_hub.publish(event)
 
     async def _set_participant_status(
         self, participant_id: str, runtime_status: str, public_focus: str | None
@@ -269,7 +401,7 @@ class DiscussionRunner:
             }
         )
 
-    async def _finish(self, summary: str | None = None) -> None:
+    async def _finish(self) -> None:
         with self.session_factory() as session:
             repository = DiscussionRepository(session)
             discussion = repository.get(self.discussion_id)
@@ -281,47 +413,38 @@ class DiscussionRunner:
             discussion.updated_at = now
             discussion.summary_status = "pending"
             repository.save(discussion)
-        fallback_summary = summary
-        summary = await self._request_summary()
-        if summary is None:
-            summary = fallback_summary
+        await self._finalize_insights()
+        await self.schedule_summary(self.discussion_id)
+
+    async def _finalize_insights(self) -> None:
+        async_finalizer = getattr(self.llm_provider, "async_finalize_insights", None)
+        finalizer = getattr(self.llm_provider, "finalize_insights", None)
+        if not callable(async_finalizer) and not callable(finalizer):
+            return
         with self.session_factory() as session:
-            repository = DiscussionRepository(session)
-            discussion = repository.get(self.discussion_id)
-            if discussion is None:
-                return
-            if summary is None:
-                discussion.summary = "总结暂不可用"
-                discussion.summary_status = "fallback"
-            else:
-                discussion.summary = summary
-                discussion.summary_status = "succeeded"
-            discussion.updated_at = self.clock()
-            repository.save(discussion)
-            payload = {"status": discussion.status, "summary": discussion.summary, "summary_status": discussion.summary_status, "finished_at": discussion.finished_at}
+            transcript = [
+                PublicUtterance.model_validate(item)
+                for item in UtteranceRepository(session).list_for_discussion(self.discussion_id)
+            ]
+        try:
+            output = await async_finalizer(transcript) if callable(async_finalizer) else finalizer(transcript)
+            replacement = self._insight_pairs(output)
+            replaced = self._replace_insights(replacement)
+        except Exception as error:
+            logger.warning(
+                "final_insights_generation_failed discussion_id=%s error_type=%s",
+                self.discussion_id,
+                type(error).__name__,
+            )
+            return
         await self.event_hub.publish(
             {
-                "type": "discussion.finished",
+                "type": "insights.updated",
                 "discussion_id": self.discussion_id,
-                **payload,
+                "insights": replaced,
+                "occurred_at": self.clock(),
             }
         )
-
-    async def _request_summary(self) -> str | None:
-        async_summarizer = getattr(self.llm_provider, "async_summarize", None)
-        summarizer = getattr(self.llm_provider, "summarize", None)
-        if not callable(async_summarizer) and not callable(summarizer):
-            return None
-        with self.session_factory() as session:
-            transcript = UtteranceRepository(session).list_for_discussion(self.discussion_id)
-        for _ in range(2):
-            try:
-                if callable(async_summarizer):
-                    return await async_summarizer(transcript)
-                return summarizer(transcript)
-            except Exception:
-                continue
-        return None
 
     async def _fail(self, error: Exception) -> None:
         with self.session_factory() as session:
@@ -356,6 +479,34 @@ class DiscussionRunner:
             repository = UtteranceRepository(session)
             saved = repository.add(Utterance(id=str(uuid4()), discussion_id=self.discussion_id, participant_id=participant_id, sequence=repository.count(self.discussion_id) + 1, content=content, created_at=self.clock()))
             return {"id": saved.id, "discussion_id": saved.discussion_id, "participant_id": saved.participant_id, "sequence": saved.sequence, "content": saved.content, "created_at": saved.created_at}
+
+    @staticmethod
+    def _closing_fallback(insights: list[PublicInsight]) -> str:
+        consensus = "；".join(item.content for item in insights if item.type == "consensus")[:100]
+        disagreement = "；".join(item.content for item in insights if item.type == "disagreement")[:100]
+        parts = ["主持人收束：本场讨论已完成。"]
+        if consensus:
+            parts.append(f"当前共识是：{consensus}。")
+        if disagreement:
+            parts.append(f"仍待继续讨论的是：{disagreement}。")
+        parts.append("下一步应将这些判断转化为可验证的行动安排。")
+        return "".join(parts)[:300]
+
+    def _fallback_speaker(
+        self, participants: list[PublicParticipant], utterance_count: int
+    ) -> PublicParticipant:
+        if utterance_count == 0:
+            return next(person for person in participants if person.role == "moderator")
+        return next(
+            (person for person in participants if str(person.id) != self._previous_speaker_id),
+            participants[0],
+        )
+
+    @staticmethod
+    def _turn_fallback(selected: PublicParticipant) -> str:
+        return (
+            f"{selected.name}：从“{selected.stance}”出发，当前更需要把前面的判断落实为可验证的条件、边界和下一步。"
+        )[:300]
 
     def _replace_insights(self, replacement: list[tuple[str, str]]) -> list[dict[str, Any]]:
         with self.session_factory() as session:

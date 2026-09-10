@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
@@ -32,12 +33,14 @@ class ScriptedProvider:
     """Deterministic provider injected into the real SQLite-backed Runner."""
 
     selections: list[dict[str, Any]]
-    turns: list[dict[str, Any]]
+    turns: list[dict[str, Any] | Exception]
     insights: list[dict[str, Any] | Exception]
     summaries: list[str | Exception]
+    final_insights: list[dict[str, Any] | Exception] | None = None
     selection_calls: int = 0
     turn_calls: int = 0
     insight_calls: int = 0
+    final_insight_calls: int = 0
     summary_calls: int = 0
 
     def select_next_speaker(self, *_: Any, **__: Any) -> dict[str, Any]:
@@ -46,11 +49,23 @@ class ScriptedProvider:
 
     def generate_turn(self, *_: Any, **__: Any) -> dict[str, Any]:
         self.turn_calls += 1
-        return self.turns.pop(0)
+        result = self.turns.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     def extract_insights(self, *_: Any, **__: Any) -> dict[str, Any]:
         self.insight_calls += 1
         result = self.insights.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def finalize_insights(self, *_: Any, **__: Any) -> dict[str, Any]:
+        self.final_insight_calls += 1
+        if self.final_insights is None:
+            raise RuntimeError("final insights are not configured")
+        result = self.final_insights.pop(0)
         if isinstance(result, Exception):
             raise result
         return result
@@ -443,6 +458,57 @@ async def test_insight_failure_keeps_saved_utterance_and_previous_insights(sqlit
 
 
 @pytest.mark.anyio
+async def test_invalid_repeated_speaker_selection_falls_back_to_an_eligible_guest(
+    sqlite_runner: Path,
+) -> None:
+    runtime_contract = _runtime_contract()
+    fixture = _make_fixture(
+        sqlite_runner,
+        runtime_contract=runtime_contract,
+        provider=ScriptedProvider(
+            selections=[
+                {"participant_id": MODERATOR_ID, "public_focus": "开场"},
+                {"participant_id": MODERATOR_ID, "public_focus": "继续开场"},
+                {"participant_id": MODERATOR_ID, "public_focus": "仍然开场"},
+            ],
+            turns=[
+                {"content": "主持人开场。", "should_end": False},
+                {"content": "嘉宾继续讨论。", "should_end": False},
+            ],
+            insights=[{"consensus": [], "disagreement": []}, {"consensus": [], "disagreement": []}],
+            summaries=[],
+        ),
+    )
+
+    await fixture.runner.run_one_turn()
+    await fixture.runner.run_one_turn()
+
+    assert fixture.status() == "RUNNING"
+    assert fixture.contents() == ["主持人开场。", "嘉宾继续讨论。"]
+    assert fixture.provider.selection_calls == 3
+
+
+@pytest.mark.anyio
+async def test_failed_normal_turn_falls_back_to_a_guest_statement(sqlite_runner: Path) -> None:
+    runtime_contract = _runtime_contract()
+    fixture = _make_fixture(
+        sqlite_runner,
+        runtime_contract=runtime_contract,
+        provider=ScriptedProvider(
+            selections=[{"participant_id": MODERATOR_ID, "public_focus": "开场"}],
+            turns=[RuntimeError("provider unavailable"), RuntimeError("provider unavailable")],
+            insights=[{"consensus": [], "disagreement": []}],
+            summaries=[],
+        ),
+    )
+
+    await fixture.runner.run_one_turn()
+
+    assert fixture.status() == "RUNNING"
+    assert fixture.contents()[0].startswith("主持人：")
+
+
+@pytest.mark.anyio
 async def test_user_stop_prevents_the_next_round_at_a_safe_point(sqlite_runner: Path) -> None:
     runtime_contract = _runtime_contract()
     fixture = _make_fixture(
@@ -522,6 +588,112 @@ async def test_fifteenth_slot_is_reserved_for_the_moderator_closing_statement(sq
 
 
 @pytest.mark.anyio
+async def test_overlong_moderator_closing_falls_back_to_a_saved_closing_statement(
+    sqlite_runner: Path,
+) -> None:
+    runtime_contract = _runtime_contract()
+    fixture = _make_fixture(
+        sqlite_runner,
+        runtime_contract=runtime_contract,
+        provider=ScriptedProvider(
+            selections=[],
+            turns=[{"content": "收束" * 151, "should_end": True}],
+            insights=[{"consensus": [], "disagreement": []}],
+            summaries=["最终总结"],
+        ),
+        initial_utterance_count=14,
+    )
+
+    await fixture.runner.run()
+
+    assert fixture.status() == "FINISHED"
+    assert len(fixture.contents()) == 15
+    assert fixture.contents()[-1].startswith("主持人收束：")
+
+
+@pytest.mark.anyio
+async def test_final_insights_are_refreshed_independently_from_the_summary(
+    sqlite_runner: Path,
+) -> None:
+    runtime_contract = _runtime_contract()
+    fixture = _make_fixture(
+        sqlite_runner,
+        runtime_contract=runtime_contract,
+        provider=ScriptedProvider(
+            selections=[{"participant_id": MODERATOR_ID, "public_focus": "收束"}],
+            turns=[{"content": "主持人结束讨论。", "should_end": True}],
+            insights=[{"consensus": ["过程共识"], "disagreement": []}],
+            final_insights=[{"consensus": ["最终共识"], "disagreement": ["最终分歧"]}],
+            summaries=["独立讨论总结"],
+        ),
+    )
+
+    await fixture.runner.run()
+
+    assert fixture.status() == "FINISHED"
+    assert sorted(fixture.active_insights(), key=lambda item: item["type"]) == [
+        {"type": "consensus", "content": "最终共识"},
+        {"type": "disagreement", "content": "最终分歧"},
+    ]
+    assert fixture.provider.final_insight_calls == 1
+
+
+@pytest.mark.anyio
+async def test_failed_independent_summary_does_not_reuse_the_moderator_closing_statement(
+    sqlite_runner: Path,
+) -> None:
+    runtime_contract = _runtime_contract()
+    fixture = _make_fixture(
+        sqlite_runner,
+        runtime_contract=runtime_contract,
+        provider=ScriptedProvider(
+            selections=[{"participant_id": MODERATOR_ID, "public_focus": "收束"}],
+            turns=[{"content": "主持人收束内容。", "should_end": True}],
+            insights=[{"consensus": [], "disagreement": []}],
+            summaries=[RuntimeError("summary unavailable")],
+        ),
+    )
+
+    await fixture.runner.run()
+
+    assert fixture.status() == "FINISHED"
+    assert fixture.contents()[-1] == "主持人收束内容。"
+    with fixture.session() as session:
+        discussion = session.get(Discussion, fixture.discussion_id)
+        assert discussion is not None
+        assert discussion.summary == "总结暂不可用"
+        assert discussion.summary_status == "fallback"
+
+
+@pytest.mark.anyio
+async def test_unavailable_summary_placeholder_is_logged_without_its_content(
+    sqlite_runner: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="app.runtime")
+    runtime_contract = _runtime_contract()
+    fixture = _make_fixture(
+        sqlite_runner,
+        runtime_contract=runtime_contract,
+        provider=ScriptedProvider(
+            selections=[{"participant_id": MODERATOR_ID, "public_focus": "收束"}],
+            turns=[{"content": "最后一条", "should_end": True}],
+            insights=[{"consensus": [], "disagreement": []}],
+            summaries=["  总结暂不可用  ", "总结暂不可用"],
+        ),
+    )
+
+    await fixture.runner.run()
+
+    with fixture.session() as session:
+        discussion = session.get(Discussion, fixture.discussion_id)
+        assert discussion is not None
+        assert discussion.summary_status == "fallback"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("summary_generation_failed" in message and "reason=unavailable_placeholder" in message for message in messages)
+    assert all("总结暂不可用" not in message for message in messages)
+
+
+@pytest.mark.anyio
 async def test_manual_summary_retry_recovers_a_legacy_fallback_discussion(sqlite_runner: Path) -> None:
     runtime_contract = _runtime_contract()
     fixture = _make_fixture(
@@ -549,7 +721,8 @@ async def test_manual_summary_retry_recovers_a_legacy_fallback_discussion(sqlite
         session.commit()
     utterance_count = len(fixture.contents())
 
-    await fixture.runner.retry_summary()
+    await fixture.runner.summary_service.begin_retry(fixture.discussion_id)
+    await fixture.runner.summary_service.generate(fixture.discussion_id)
 
     with fixture.session() as session:
         discussion = session.get(Discussion, fixture.discussion_id)
@@ -558,6 +731,180 @@ async def test_manual_summary_retry_recovers_a_legacy_fallback_discussion(sqlite
         assert discussion.summary_status == "succeeded"
     assert len(fixture.contents()) == utterance_count
     assert fixture.provider.selection_calls == 1
+
+
+@pytest.mark.anyio
+async def test_summary_retry_rejects_the_unavailable_placeholder(sqlite_runner: Path) -> None:
+    runtime_contract = _runtime_contract()
+    fixture = _make_fixture(
+        sqlite_runner,
+        runtime_contract=runtime_contract,
+        provider=ScriptedProvider(
+            selections=[{"participant_id": MODERATOR_ID, "public_focus": "收束"}],
+            turns=[{"content": "最后一条", "should_end": True}],
+            insights=[{"consensus": [], "disagreement": []}],
+            summaries=[
+                RuntimeError("summary unavailable"),
+                RuntimeError("summary unavailable"),
+                "总结暂不可用",
+            ],
+        ),
+    )
+
+    await fixture.runner.run()
+    await fixture.runner.summary_service.begin_retry(fixture.discussion_id)
+    await fixture.runner.summary_service.generate(fixture.discussion_id)
+
+    with fixture.session() as session:
+        discussion = session.get(Discussion, fixture.discussion_id)
+        assert discussion is not None
+        assert discussion.summary == "总结暂不可用"
+        assert discussion.summary_status == "fallback"
+
+
+@pytest.mark.anyio
+async def test_summary_task_persists_pending_before_publishing_its_final_result(
+    sqlite_runner: Path,
+) -> None:
+    runtime = import_module("app.runtime")
+    summary_service_type = getattr(runtime, "SummaryGenerationService")
+    summary_registry_type = getattr(runtime, "SummaryTaskRegistry")
+    runtime_contract = _runtime_contract()
+    fixture = _make_fixture(
+        sqlite_runner,
+        runtime_contract=runtime_contract,
+        provider=ScriptedProvider(
+            selections=[],
+            turns=[],
+            insights=[],
+            summaries=["独立重试总结"],
+        ),
+    )
+    with fixture.session() as session:
+        discussion = session.get(Discussion, fixture.discussion_id)
+        assert discussion is not None
+        discussion.status = "FINISHED"
+        discussion.summary = "总结暂不可用"
+        discussion.summary_status = "fallback"
+        discussion.finished_at = datetime.now(UTC)
+        session.commit()
+    service = summary_service_type(
+        session_factory=fixture.session_factory,
+        llm_provider=fixture.provider,
+        event_hub=fixture.event_hub,
+    )
+    registry = summary_registry_type()
+    subscription = await fixture.event_hub.subscribe(fixture.discussion_id)
+
+    await service.begin_retry(fixture.discussion_id)
+    await registry.start(fixture.discussion_id, service.generate)
+    with fixture.session() as session:
+        discussion = session.get(Discussion, fixture.discussion_id)
+        assert discussion is not None
+        assert discussion.summary is None
+        assert discussion.summary_status == "pending"
+
+    await registry.wait(fixture.discussion_id)
+    events = await _events_until(subscription, "discussion.finished")
+    with fixture.session() as session:
+        discussion = session.get(Discussion, fixture.discussion_id)
+        assert discussion is not None
+        assert discussion.summary == "独立重试总结"
+        assert discussion.summary_status == "succeeded"
+    assert events[-1]["summary_status"] == "succeeded"
+
+
+@pytest.mark.anyio
+async def test_summary_task_passes_public_utterances_to_an_async_provider(sqlite_runner: Path) -> None:
+    summary_service_type = getattr(import_module("app.runtime"), "SummaryGenerationService")
+    runtime_contract = _runtime_contract()
+    fixture = _make_fixture(
+        sqlite_runner,
+        runtime_contract=runtime_contract,
+        provider=ScriptedProvider(
+            selections=[],
+            turns=[],
+            insights=[],
+            summaries=[],
+        ),
+        initial_utterance_count=1,
+    )
+    with fixture.session() as session:
+        discussion = session.get(Discussion, fixture.discussion_id)
+        assert discussion is not None
+        discussion.status = "FINISHED"
+        discussion.summary_status = "pending"
+        discussion.finished_at = datetime.now(UTC)
+        session.commit()
+
+    class AsyncSummaryProvider:
+        async def async_summarize(self, transcript: list[Any]) -> str:
+            assert all(hasattr(item, "model_dump") for item in transcript)
+            return "异步独立总结"
+
+    service = summary_service_type(
+        session_factory=fixture.session_factory,
+        llm_provider=AsyncSummaryProvider(),
+        event_hub=fixture.event_hub,
+    )
+    await service.generate(fixture.discussion_id)
+
+    with fixture.session() as session:
+        discussion = session.get(Discussion, fixture.discussion_id)
+        assert discussion is not None
+        assert discussion.summary == "异步独立总结"
+        assert discussion.summary_status == "succeeded"
+
+
+@pytest.mark.anyio
+async def test_summary_task_registry_rejects_a_duplicate_task_for_the_same_discussion() -> None:
+    registry_type = getattr(import_module("app.runtime"), "SummaryTaskRegistry")
+    registry = registry_type()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def generate(_: str) -> None:
+        started.set()
+        await release.wait()
+
+    await registry.start(DISCUSSION_A, generate)
+    await started.wait()
+    with pytest.raises(RuntimeError, match="summary task already started"):
+        await registry.start(DISCUSSION_A, generate)
+    release.set()
+    await registry.wait(DISCUSSION_A)
+
+
+@pytest.mark.anyio
+async def test_summary_recovery_turns_interrupted_pending_work_back_into_a_retryable_fallback(
+    sqlite_runner: Path,
+) -> None:
+    summary_service_type = getattr(import_module("app.runtime"), "SummaryGenerationService")
+    runtime_contract = _runtime_contract()
+    fixture = _make_fixture(
+        sqlite_runner,
+        runtime_contract=runtime_contract,
+        provider=ScriptedProvider(selections=[], turns=[], insights=[], summaries=[]),
+    )
+    with fixture.session() as session:
+        discussion = session.get(Discussion, fixture.discussion_id)
+        assert discussion is not None
+        discussion.status = "FINISHED"
+        discussion.summary_status = "pending"
+        discussion.finished_at = datetime.now(UTC)
+        session.commit()
+    service = summary_service_type(
+        session_factory=fixture.session_factory,
+        llm_provider=fixture.provider,
+        event_hub=fixture.event_hub,
+    )
+
+    assert service.recover_interrupted() == 1
+    with fixture.session() as session:
+        discussion = session.get(Discussion, fixture.discussion_id)
+        assert discussion is not None
+        assert discussion.summary == "总结暂不可用"
+        assert discussion.summary_status == "fallback"
 
 
 @pytest.mark.anyio
@@ -602,7 +949,7 @@ async def test_expert_end_request_adds_a_moderator_closing_statement_as_the_summ
 
 
 @pytest.mark.anyio
-async def test_failure_in_one_discussion_does_not_stop_another_discussion(sqlite_runner: Path) -> None:
+async def test_model_degradation_in_one_discussion_does_not_stop_another_discussion(sqlite_runner: Path) -> None:
     runtime_contract = _runtime_contract()
     failed = _make_fixture(
         sqlite_runner,
@@ -639,6 +986,6 @@ async def test_failure_in_one_discussion_does_not_stop_another_discussion(sqlite
     await asyncio.gather(registry.start(failed.runner), registry.start(healthy.runner))
     await asyncio.gather(failed.runner.wait_until_done(), healthy.runner.wait_until_done())
 
-    assert failed.status() == "FAILED"
+    assert failed.status() == "FINISHED"
     assert healthy.status() == "FINISHED"
     assert healthy.contents() == ["B 场发言"]

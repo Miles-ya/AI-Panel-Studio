@@ -55,6 +55,16 @@ class DiscussionRepository:
     def list(self) -> list[Discussion]:
         return list(self.session.scalars(select(Discussion).order_by(Discussion.updated_at.desc())))
 
+    def list_finished_with_pending_summary(self) -> list[Discussion]:
+        return list(
+            self.session.scalars(
+                select(Discussion).where(
+                    Discussion.status == "FINISHED",
+                    Discussion.summary_status == "pending",
+                )
+            )
+        )
+
     def participant_count(self, discussion_id: str) -> int:
         return int(
             self.session.scalar(
