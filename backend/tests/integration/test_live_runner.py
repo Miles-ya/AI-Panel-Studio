@@ -21,8 +21,10 @@ DISCUSSION_A = "11111111-1111-4111-8111-111111111111"
 DISCUSSION_B = "22222222-2222-4222-8222-222222222222"
 MODERATOR_ID = "33333333-3333-4333-8333-333333333333"
 EXPERT_ONE_ID = "44444444-4444-4444-8444-444444444444"
+EXPERT_TWO_ID = "55555555-5555-4555-8555-555555555555"
 OTHER_MODERATOR_ID = "66666666-6666-4666-8666-666666666666"
 OTHER_EXPERT_ID = "77777777-7777-4777-8777-777777777777"
+OTHER_EXPERT_TWO_ID = "88888888-8888-4888-8888-888888888888"
 
 
 @dataclass
@@ -200,6 +202,11 @@ def _repository_types() -> tuple[type[Any], type[Any], type[Any]]:
 
 
 def _participant(*, participant_id: str, discussion_id: str, role: str, name: str) -> Participant:
+    colors = {
+        "主持人": "#2563EB",
+        "专家一": "#F59E0B",
+        "专家二": "#10B981",
+    }
     return Participant(
         id=participant_id,
         discussion_id=discussion_id,
@@ -208,7 +215,7 @@ def _participant(*, participant_id: str, discussion_id: str, role: str, name: st
         profession="测试职业",
         title="测试职务",
         stance=f"{name} 的公开立场",
-        color="#2563EB" if role == "moderator" else "#F59E0B",
+        color=colors[name],
         runtime_status="idle",
         created_at=datetime.now(UTC),
     )
@@ -218,18 +225,18 @@ def _seed_discussion(
     engine: Engine,
     *,
     discussion_id: str,
-    participant_ids: tuple[str, str],
+    participant_ids: tuple[str, str, str],
     initial_utterance_count: int = 0,
     active_insights: list[tuple[str, str]] | None = None,
 ) -> None:
     now = datetime.now(UTC)
-    moderator_id, expert_id = participant_ids
+    moderator_id, expert_one_id, expert_two_id = participant_ids
     with Session(engine) as session:
         session.add(
             Discussion(
                 id=discussion_id,
                 topic=f"测试讨论 {discussion_id}",
-                expert_count=1,
+                expert_count=2,
                 max_public_utterances=15,
                 status="RUNNING",
                 cast_confirmed=True,
@@ -247,19 +254,26 @@ def _seed_discussion(
                     name="主持人",
                 ),
                 _participant(
-                    participant_id=expert_id,
+                    participant_id=expert_one_id,
                     discussion_id=discussion_id,
                     role="expert",
                     name="专家一",
                 ),
+                _participant(
+                    participant_id=expert_two_id,
+                    discussion_id=discussion_id,
+                    role="expert",
+                    name="专家二",
+                ),
             ]
         )
         for sequence in range(1, initial_utterance_count + 1):
+            participant_id = (moderator_id, expert_one_id, expert_two_id)[(sequence - 1) % 3]
             session.add(
                 Utterance(
                     id=f"{discussion_id[:8]}-{sequence:028d}",
                     discussion_id=discussion_id,
-                    participant_id=moderator_id if sequence % 2 else expert_id,
+                    participant_id=participant_id,
                     sequence=sequence,
                     content=f"既有发言 {sequence}",
                     created_at=now + timedelta(microseconds=sequence),
@@ -281,28 +295,27 @@ def _seed_discussion(
 
 
 @pytest.fixture()
-def sqlite_runner(tmp_path: Path) -> Engine:
-    engine = create_sqlite_engine(f"sqlite:///{tmp_path / 'runner.db'}")
-    initialize_database(engine, seed=False)
-    try:
-        yield engine
-    finally:
-        engine.dispose()
+def sqlite_runner(tmp_path: Path) -> Path:
+    return tmp_path / "runner.db"
 
 
 def _make_fixture(
-    engine: Engine,
+    database: Path | Engine,
     *,
+    runtime_contract: tuple[type[Any], type[Any], type[Any]],
     provider: ScriptedProvider,
     discussion_id: str = DISCUSSION_A,
-    participant_ids: tuple[str, str] = (MODERATOR_ID, EXPERT_ONE_ID),
+    participant_ids: tuple[str, str, str] = (MODERATOR_ID, EXPERT_ONE_ID, EXPERT_TWO_ID),
     initial_utterance_count: int = 0,
     active_insights: list[tuple[str, str]] | None = None,
     event_hub_wrapper: Callable[[Any, sessionmaker[Session]], Any] | None = None,
     seed: bool = True,
 ) -> SqliteRunnerFixture:
-    runner_type, event_hub_type, _ = _runtime_contract()
+    runner_type, event_hub_type, _ = runtime_contract
     participant_type, utterance_type, insight_type = _repository_types()
+    engine = database if isinstance(database, Engine) else create_sqlite_engine(f"sqlite:///{database}")
+    if isinstance(database, Path):
+        initialize_database(engine, seed=False)
     if seed:
         _seed_discussion(
             engine,
@@ -346,10 +359,12 @@ async def _events_until(subscription: Any, event_type: str) -> list[dict[str, An
 
 @pytest.mark.anyio
 async def test_utterance_created_is_published_after_persisted_status_and_utterance(
-    sqlite_runner: Engine,
+    sqlite_runner: Path,
 ) -> None:
+    runtime_contract = _runtime_contract()
     fixture = _make_fixture(
         sqlite_runner,
+        runtime_contract=runtime_contract,
         provider=ScriptedProvider(
             selections=[{"participant_id": MODERATOR_ID, "public_focus": "界定问题"}],
             turns=[{"content": "第一条公开发言", "should_end": True}],
@@ -378,9 +393,11 @@ async def test_utterance_created_is_published_after_persisted_status_and_utteran
 
 
 @pytest.mark.anyio
-async def test_each_round_replaces_the_complete_active_insight_set(sqlite_runner: Engine) -> None:
+async def test_each_round_replaces_the_complete_active_insight_set(sqlite_runner: Path) -> None:
+    runtime_contract = _runtime_contract()
     fixture = _make_fixture(
         sqlite_runner,
+        runtime_contract=runtime_contract,
         provider=ScriptedProvider(
             selections=[
                 {"participant_id": MODERATOR_ID, "public_focus": "先定义目标"},
@@ -406,9 +423,11 @@ async def test_each_round_replaces_the_complete_active_insight_set(sqlite_runner
 
 
 @pytest.mark.anyio
-async def test_insight_failure_keeps_saved_utterance_and_previous_insights(sqlite_runner: Engine) -> None:
+async def test_insight_failure_keeps_saved_utterance_and_previous_insights(sqlite_runner: Path) -> None:
+    runtime_contract = _runtime_contract()
     fixture = _make_fixture(
         sqlite_runner,
+        runtime_contract=runtime_contract,
         provider=ScriptedProvider(
             selections=[{"participant_id": MODERATOR_ID, "public_focus": "先发言"}],
             turns=[{"content": "保留下来的发言", "should_end": True}],
@@ -429,9 +448,11 @@ async def test_insight_failure_keeps_saved_utterance_and_previous_insights(sqlit
 
 
 @pytest.mark.anyio
-async def test_user_stop_prevents_the_next_round_at_a_safe_point(sqlite_runner: Engine) -> None:
+async def test_user_stop_prevents_the_next_round_at_a_safe_point(sqlite_runner: Path) -> None:
+    runtime_contract = _runtime_contract()
     fixture = _make_fixture(
         sqlite_runner,
+        runtime_contract=runtime_contract,
         provider=ScriptedProvider(
             selections=[{"participant_id": MODERATOR_ID, "public_focus": "开始"}],
             turns=[{"content": "停止前的发言", "should_end": False}],
@@ -454,11 +475,13 @@ async def test_user_stop_prevents_the_next_round_at_a_safe_point(sqlite_runner: 
 
 
 @pytest.mark.anyio
-async def test_fifteenth_saved_utterance_is_last_and_triggers_completion(sqlite_runner: Engine) -> None:
+async def test_fifteenth_saved_utterance_is_last_and_triggers_completion(sqlite_runner: Path) -> None:
+    runtime_contract = _runtime_contract()
     fixture = _make_fixture(
         sqlite_runner,
+        runtime_contract=runtime_contract,
         provider=ScriptedProvider(
-            selections=[{"participant_id": EXPERT_ONE_ID, "public_focus": "继续"}],
+            selections=[{"participant_id": EXPERT_TWO_ID, "public_focus": "继续"}],
             turns=[{"content": "第 15 条", "should_end": False}],
             insights=[{"consensus": [], "disagreement": []}],
             summaries=["达到公开发言上限"],
@@ -476,9 +499,11 @@ async def test_fifteenth_saved_utterance_is_last_and_triggers_completion(sqlite_
 
 
 @pytest.mark.anyio
-async def test_summary_retries_then_falls_back_and_manual_retry_recovers(sqlite_runner: Engine) -> None:
+async def test_summary_retries_then_falls_back_and_manual_retry_recovers(sqlite_runner: Path) -> None:
+    runtime_contract = _runtime_contract()
     fixture = _make_fixture(
         sqlite_runner,
+        runtime_contract=runtime_contract,
         provider=ScriptedProvider(
             selections=[{"participant_id": MODERATOR_ID, "public_focus": "收束"}],
             turns=[{"content": "最后一条", "should_end": True}],
@@ -509,9 +534,11 @@ async def test_summary_retries_then_falls_back_and_manual_retry_recovers(sqlite_
 
 
 @pytest.mark.anyio
-async def test_failure_in_one_discussion_does_not_stop_another_discussion(sqlite_runner: Engine) -> None:
+async def test_failure_in_one_discussion_does_not_stop_another_discussion(sqlite_runner: Path) -> None:
+    runtime_contract = _runtime_contract()
     failed = _make_fixture(
         sqlite_runner,
+        runtime_contract=runtime_contract,
         provider=ScriptedProvider(
             selections=[{"participant_id": OTHER_EXPERT_ID, "public_focus": "越界"}],
             turns=[],
@@ -519,15 +546,15 @@ async def test_failure_in_one_discussion_does_not_stop_another_discussion(sqlite
             summaries=[],
         ),
         discussion_id=DISCUSSION_A,
-        participant_ids=(MODERATOR_ID, EXPERT_ONE_ID),
     )
     _seed_discussion(
-        sqlite_runner,
+        failed.engine,
         discussion_id=DISCUSSION_B,
-        participant_ids=(OTHER_MODERATOR_ID, OTHER_EXPERT_ID),
+        participant_ids=(OTHER_MODERATOR_ID, OTHER_EXPERT_ID, OTHER_EXPERT_TWO_ID),
     )
     healthy = _make_fixture(
-        sqlite_runner,
+        failed.engine,
+        runtime_contract=runtime_contract,
         provider=ScriptedProvider(
             selections=[{"participant_id": OTHER_MODERATOR_ID, "public_focus": "正常开始"}],
             turns=[{"content": "B 场发言", "should_end": True}],
@@ -535,10 +562,10 @@ async def test_failure_in_one_discussion_does_not_stop_another_discussion(sqlite
             summaries=["B 场完成"],
         ),
         discussion_id=DISCUSSION_B,
-        participant_ids=(OTHER_MODERATOR_ID, OTHER_EXPERT_ID),
+        participant_ids=(OTHER_MODERATOR_ID, OTHER_EXPERT_ID, OTHER_EXPERT_TWO_ID),
         seed=False,
     )
-    _, _, registry_type = _runtime_contract()
+    _, _, registry_type = runtime_contract
     registry = registry_type()
 
     await asyncio.gather(registry.start(failed.runner), registry.start(healthy.runner))
