@@ -125,10 +125,13 @@ class PersistenceCheckingEventHub:
         event = kwargs.get("event") or next(
             (value for value in reversed(args) if isinstance(value, dict)), None
         )
-        if event is not None and event.get("type") in {
-            "participant.status.changed",
-            "utterance.created",
-        }:
+        if event is not None and (
+            event.get("type") == "utterance.created"
+            or (
+                event.get("type") == "participant.status.changed"
+                and event.get("participant", {}).get("runtime_status") in {"preparing", "speaking"}
+            )
+        ):
             discussion_id = event["discussion_id"]
             participant_id = event.get("participant", {}).get("id")
             utterance_id = event.get("utterance", {}).get("id")
@@ -459,7 +462,7 @@ async def test_user_stop_prevents_the_next_round_at_a_safe_point(sqlite_runner: 
             insights=[{"consensus": [], "disagreement": []}],
             summaries=["用户主动结束"],
         ),
-        event_hub_wrapper=SafePointEventHub,
+        event_hub_wrapper=lambda event_hub, _: SafePointEventHub(event_hub),
     )
     subscription = await fixture.event_hub.subscribe(fixture.discussion_id)
 
