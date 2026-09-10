@@ -58,6 +58,25 @@ class ParticipantDto(ContractModel):
     public_focus: str | None
 
 
+class UtteranceDto(ContractModel):
+    id: str
+    discussion_id: str
+    participant_id: str
+    sequence: int
+    content: str
+    created_at: datetime
+
+
+class InsightDto(ContractModel):
+    id: str
+    discussion_id: str
+    type: InsightType
+    content: str
+    active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
 class DiscussionDto(ContractModel):
     id: str
     topic: str
@@ -65,6 +84,17 @@ class DiscussionDto(ContractModel):
     max_public_utterances: int
     status: DiscussionStatus
     cast_confirmed: bool
+    cast_confirmed_at: datetime | None
+    summary: str | None
+    summary_status: str
+    error_code: str | None
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    participants: list[ParticipantDto] = Field(default_factory=list)
+    utterances: list[UtteranceDto] = Field(default_factory=list)
+    insights: list[InsightDto] = Field(default_factory=list)
 
 
 class CreateDiscussionRequest(ContractModel):
@@ -97,3 +127,16 @@ class StartDiscussionDto(ContractModel):
     id: str
     status: DiscussionStatus
     started_at: datetime | None
+
+
+class StopDiscussionDto(ContractModel):
+    id: str
+    status: DiscussionStatus
+    stop_requested: bool
+
+
+class RetrySummaryDto(ContractModel):
+    id: str
+    status: DiscussionStatus
+    summary_status: str
+    retry_requested: bool

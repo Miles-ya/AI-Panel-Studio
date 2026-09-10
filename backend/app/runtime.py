@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy.orm import Session, sessionmaker
+
 from app.llm import (
     PublicInsight,
     PublicParticipant,
@@ -64,20 +66,14 @@ class DiscussionRunner:
         self,
         *,
         discussion_id: str,
-        discussion_repository: DiscussionRepository,
-        participant_repository: ParticipantRepository,
-        utterance_repository: UtteranceRepository,
-        insight_repository: InsightRepository,
+        session_factory: sessionmaker[Session],
         llm_provider: Any,
         event_hub: EventHub,
         stop_event: asyncio.Event | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.discussion_id = discussion_id
-        self.discussion_repository = discussion_repository
-        self.participant_repository = participant_repository
-        self.utterance_repository = utterance_repository
-        self.insight_repository = insight_repository
+        self.session_factory = session_factory
         self.llm_provider = llm_provider
         self.event_hub = event_hub
         self.stop_event = stop_event or asyncio.Event()
@@ -87,8 +83,9 @@ class DiscussionRunner:
 
     @property
     def status(self) -> str:
-        discussion = self.discussion_repository.get(self.discussion_id)
-        return discussion.status if discussion is not None else "UNKNOWN"
+        with self.session_factory() as session:
+            discussion = DiscussionRepository(session).get(self.discussion_id)
+            return discussion.status if discussion is not None else "UNKNOWN"
 
     def attach_task(self, task: asyncio.Task[None]) -> None:
         self._task = task
@@ -106,7 +103,7 @@ class DiscussionRunner:
     async def run(self) -> None:
         try:
             while self.status == "RUNNING":
-                count = self.utterance_repository.count(self.discussion_id)
+                count = self._utterance_count()
                 if self.stop_event.is_set() or count >= 15:
                     await self._finish()
                     return
@@ -118,19 +115,24 @@ class DiscussionRunner:
     async def run_one_turn(self) -> bool:
         if self.status != "RUNNING":
             return False
-        if self.stop_event.is_set() or self.utterance_repository.count(self.discussion_id) >= 15:
+        if self.stop_event.is_set() or self._utterance_count() >= 15:
             await self._finish()
             return False
 
-        participants = self.participant_repository.list_for_discussion(self.discussion_id)
-        transcript = self.utterance_repository.list_for_discussion(self.discussion_id)
-        active_insights = self.insight_repository.active_for_discussion(self.discussion_id)
-        public_participants = [PublicParticipant.model_validate(item) for item in participants]
-        public_transcript = [PublicUtterance.model_validate(item) for item in transcript]
-        public_insights = [PublicInsight.model_validate(item) for item in active_insights]
-        discussion = self.discussion_repository.get(self.discussion_id)
-        if discussion is None:
-            raise LookupError(self.discussion_id)
+        with self.session_factory() as session:
+            discussion_repository = DiscussionRepository(session)
+            participant_repository = ParticipantRepository(session)
+            utterance_repository = UtteranceRepository(session)
+            insight_repository = InsightRepository(session)
+            discussion = discussion_repository.get(self.discussion_id)
+            if discussion is None:
+                raise LookupError(self.discussion_id)
+            participants = participant_repository.list_for_discussion(self.discussion_id)
+            transcript = utterance_repository.list_for_discussion(self.discussion_id)
+            active_insights = insight_repository.active_for_discussion(self.discussion_id)
+            public_participants = [PublicParticipant.model_validate(item) for item in participants]
+            public_transcript = [PublicUtterance.model_validate(item) for item in transcript]
+            public_insights = [PublicInsight.model_validate(item) for item in active_insights]
 
         selection_input = SpeakerSelectionInput(
             discussion_id=self.discussion_id,
@@ -142,41 +144,31 @@ class DiscussionRunner:
             stop_requested=self.stop_event.is_set(),
         )
         selection = SpeakerSelector(self.llm_provider).select_next_speaker(selection_input)
-        selected = next(
-            participant for participant in participants if str(participant.id) == str(selection.participant_id)
-        )
+        selected = next(person for person in public_participants if str(person.id) == str(selection.participant_id))
 
-        await self._set_participant_status(selected, "preparing", selection.public_focus)
-        await self._set_participant_status(selected, "speaking", selection.public_focus)
+        await self._set_participant_status(str(selected.id), "preparing", selection.public_focus)
+        await self._set_participant_status(str(selected.id), "speaking", selection.public_focus)
 
         turn_input = TurnGenerationInput(
             discussion_id=self.discussion_id,
             participants=public_participants,
             transcript=public_transcript,
             active_insights=public_insights,
-            selected_participant=PublicParticipant.model_validate(selected),
+            selected_participant=selected,
         )
         turn = TurnGenerator(self.llm_provider).generate_turn(turn_input)
-        saved = self.utterance_repository.add(
-            Utterance(
-                id=str(uuid4()),
-                discussion_id=self.discussion_id,
-                participant_id=selected.id,
-                sequence=self.utterance_repository.count(self.discussion_id) + 1,
-                content=turn.content,
-                created_at=self.clock(),
-            )
-        )
+        saved = self._save_utterance(str(selected.id), turn.content)
         await self.event_hub.publish(
             {
                 "type": "utterance.created",
                 "discussion_id": self.discussion_id,
                 "utterance": {
-                    "id": saved.id,
-                    "discussion_id": saved.discussion_id,
-                    "participant_id": saved.participant_id,
-                    "sequence": saved.sequence,
-                    "content": saved.content,
+                    "id": saved["id"],
+                    "discussion_id": saved["discussion_id"],
+                    "participant_id": saved["participant_id"],
+                    "sequence": saved["sequence"],
+                    "content": saved["content"],
+                    "created_at": saved["created_at"],
                 },
             }
         )
@@ -186,91 +178,51 @@ class DiscussionRunner:
             try:
                 output = extractor(saved, active_insights)
                 replacement = self._insight_pairs(output)
-                replaced = self.insight_repository.replace_active(
-                    self.discussion_id, replacement, now=self.clock()
-                )
+                replaced = self._replace_insights(replacement)
                 await self.event_hub.publish(
                     {
                         "type": "insights.updated",
                         "discussion_id": self.discussion_id,
                         "insights": [
                             {
-                                "id": item.id,
-                                "discussion_id": item.discussion_id,
-                                "type": item.type,
-                                "content": item.content,
-                                "active": item.active,
+                                "id": item["id"],
+                                "discussion_id": item["discussion_id"],
+                                "type": item["type"],
+                                "content": item["content"],
+                                "active": item["active"],
+                                "created_at": item["created_at"],
+                                "updated_at": item["updated_at"],
                             }
                             for item in replaced
                         ],
+                        "occurred_at": self.clock(),
                     }
                 )
             except Exception:
                 pass
 
-        await self._set_participant_status(selected, "idle", None)
+        await self._set_participant_status(str(selected.id), "idle", None)
         self._previous_speaker_id = str(selected.id)
-        if turn.should_end or self.stop_event.is_set() or self.utterance_repository.count(self.discussion_id) >= 15:
+        if turn.should_end or self.stop_event.is_set() or self._utterance_count() >= 15:
             await self._finish()
         return True
 
     async def retry_summary(self) -> None:
-        discussion = self.discussion_repository.get(self.discussion_id)
-        if discussion is None or discussion.status != "FINISHED" or discussion.summary_status != "fallback":
-            raise ValueError("summary retry is only available for finished fallback discussions")
+        with self.session_factory() as session:
+            discussion = DiscussionRepository(session).get(self.discussion_id)
+            if discussion is None or discussion.status != "FINISHED" or discussion.summary_status != "fallback":
+                raise ValueError("summary retry is only available for finished fallback discussions")
         summary = await self._request_summary()
-        if summary is None:
-            return
-        discussion.summary = summary
-        discussion.summary_status = "succeeded"
-        discussion.updated_at = self.clock()
-        self.discussion_repository.save(discussion)
-
-    async def _set_participant_status(
-        self, participant: Participant, runtime_status: str, public_focus: str | None
-    ) -> None:
-        saved = self.participant_repository.set_runtime_status(
-            participant.id,
-            self.discussion_id,
-            runtime_status,
-            public_focus,
-        )
-        await self.event_hub.publish(
-            {
-                "type": "participant.status.changed",
-                "discussion_id": self.discussion_id,
-                "participant": {
-                    "id": saved.id,
-                    "runtime_status": saved.runtime_status,
-                    "public_focus": saved.public_focus,
-                },
-            }
-        )
-
-    async def _finish(self) -> None:
-        discussion = self.discussion_repository.get(self.discussion_id)
-        if discussion is None or discussion.status != "RUNNING":
-            return
-        now = self.clock()
-        discussion.status = "FINISHED"
-        discussion.finished_at = now
-        discussion.updated_at = now
-        discussion.summary_status = "pending"
-        self.discussion_repository.save(discussion)
-        summary = await self._request_summary()
-        discussion = self.discussion_repository.get(self.discussion_id)
-        if discussion is None:
-            return
-        if summary is None:
-            discussion.summary = "总结暂不可用"
-            discussion.summary_status = "fallback"
-        else:
-            discussion.summary = summary
-            discussion.summary_status = "succeeded"
-        discussion.updated_at = self.clock()
-        self.discussion_repository.save(discussion)
-        await self.event_hub.publish(
-            {
+        with self.session_factory() as session:
+            discussion = DiscussionRepository(session).get(self.discussion_id)
+            if discussion is None:
+                return
+            if summary is not None:
+                discussion.summary = summary
+                discussion.summary_status = "succeeded"
+                discussion.updated_at = self.clock()
+                DiscussionRepository(session).save(discussion)
+            event = {
                 "type": "discussion.finished",
                 "discussion_id": self.discussion_id,
                 "status": discussion.status,
@@ -278,13 +230,66 @@ class DiscussionRunner:
                 "summary_status": discussion.summary_status,
                 "finished_at": discussion.finished_at,
             }
+        await self.event_hub.publish(event)
+
+    async def _set_participant_status(
+        self, participant_id: str, runtime_status: str, public_focus: str | None
+    ) -> None:
+        with self.session_factory() as session:
+            saved = ParticipantRepository(session).set_runtime_status(
+                participant_id, self.discussion_id, runtime_status, public_focus
+            )
+            payload = {"id": saved.id, "runtime_status": saved.runtime_status, "public_focus": saved.public_focus}
+        await self.event_hub.publish(
+            {
+                "type": "participant.status.changed",
+                "discussion_id": self.discussion_id,
+                "participant": payload,
+                "occurred_at": self.clock(),
+            }
+        )
+
+    async def _finish(self) -> None:
+        with self.session_factory() as session:
+            repository = DiscussionRepository(session)
+            discussion = repository.get(self.discussion_id)
+            if discussion is None or discussion.status != "RUNNING":
+                return
+            now = self.clock()
+            discussion.status = "FINISHED"
+            discussion.finished_at = now
+            discussion.updated_at = now
+            discussion.summary_status = "pending"
+            repository.save(discussion)
+        summary = await self._request_summary()
+        with self.session_factory() as session:
+            repository = DiscussionRepository(session)
+            discussion = repository.get(self.discussion_id)
+            if discussion is None:
+                return
+            if summary is None:
+                discussion.summary = "总结暂不可用"
+                discussion.summary_status = "fallback"
+            else:
+                discussion.summary = summary
+                discussion.summary_status = "succeeded"
+            discussion.updated_at = self.clock()
+            repository.save(discussion)
+            payload = {"status": discussion.status, "summary": discussion.summary, "summary_status": discussion.summary_status, "finished_at": discussion.finished_at}
+        await self.event_hub.publish(
+            {
+                "type": "discussion.finished",
+                "discussion_id": self.discussion_id,
+                **payload,
+            }
         )
 
     async def _request_summary(self) -> str | None:
         summarizer = getattr(self.llm_provider, "summarize", None)
         if summarizer is None:
             return None
-        transcript = self.utterance_repository.list_for_discussion(self.discussion_id)
+        with self.session_factory() as session:
+            transcript = UtteranceRepository(session).list_for_discussion(self.discussion_id)
         for _ in range(2):
             try:
                 return summarizer(transcript)
@@ -293,13 +298,15 @@ class DiscussionRunner:
         return None
 
     async def _fail(self, error: Exception) -> None:
-        discussion = self.discussion_repository.get(self.discussion_id)
-        if discussion is None or discussion.status != "RUNNING":
-            return
-        discussion.status = "FAILED"
-        discussion.error_code = "RUNNER_FAILED"
-        discussion.updated_at = self.clock()
-        self.discussion_repository.save(discussion)
+        with self.session_factory() as session:
+            repository = DiscussionRepository(session)
+            discussion = repository.get(self.discussion_id)
+            if discussion is None or discussion.status != "RUNNING":
+                return
+            discussion.status = "FAILED"
+            discussion.error_code = "RUNNER_FAILED"
+            discussion.updated_at = self.clock()
+            repository.save(discussion)
         await self.event_hub.publish(
             {
                 "type": "discussion.error",
@@ -310,8 +317,24 @@ class DiscussionRunner:
                     "message": "本轮讨论生成失败，系统已停止该讨论。",
                     "details": {},
                 },
+                "occurred_at": self.clock(),
             }
         )
+
+    def _utterance_count(self) -> int:
+        with self.session_factory() as session:
+            return UtteranceRepository(session).count(self.discussion_id)
+
+    def _save_utterance(self, participant_id: str, content: str) -> dict[str, Any]:
+        with self.session_factory() as session:
+            repository = UtteranceRepository(session)
+            saved = repository.add(Utterance(id=str(uuid4()), discussion_id=self.discussion_id, participant_id=participant_id, sequence=repository.count(self.discussion_id) + 1, content=content, created_at=self.clock()))
+            return {"id": saved.id, "discussion_id": saved.discussion_id, "participant_id": saved.participant_id, "sequence": saved.sequence, "content": saved.content, "created_at": saved.created_at}
+
+    def _replace_insights(self, replacement: list[tuple[str, str]]) -> list[dict[str, Any]]:
+        with self.session_factory() as session:
+            items = InsightRepository(session).replace_active(self.discussion_id, replacement, now=self.clock())
+            return [{"id": item.id, "discussion_id": item.discussion_id, "type": item.type, "content": item.content, "active": item.active, "created_at": item.created_at, "updated_at": item.updated_at} for item in items]
 
     @staticmethod
     def _insight_pairs(output: object) -> list[tuple[str, str]]:

@@ -139,11 +139,13 @@ async def test_snapshot_event_is_complete_aggregate_identical_to_rest_snapshot(
 
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         rest_snapshot = (await client.get(f"/api/discussions/{discussion_id}")).json()
-        response = await client.get(f"/api/discussions/{discussion_id}/events")
 
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/event-stream")
-    event_name, data = _parse_sse_frame(response.content)
+    route = next(route for route in app.routes if getattr(route, "path", "") == "/api/discussions/{discussion_id}/events")
+    response = await route.endpoint(discussion_id)
+    assert response.media_type == "text/event-stream"
+    event_name, data = _parse_sse_frame(
+        await asyncio.wait_for(response.body_iterator.__anext__(), timeout=0.5)
+    )
     assert event_name == "discussion.snapshot"
     assert data["discussion_id"] == discussion_id
     assert data["discussion"] == rest_snapshot
@@ -167,6 +169,12 @@ async def test_stream_body_iterator_emits_public_event_frames_without_closing_co
     assert response.media_type == "text/event-stream"
     iterator = response.body_iterator
     assert hasattr(iterator, "__anext__")
+
+    snapshot_name, snapshot_data = _parse_sse_frame(
+        await asyncio.wait_for(iterator.__anext__(), timeout=0.5)
+    )
+    assert snapshot_name == "discussion.snapshot"
+    assert snapshot_data["discussion_id"] == discussion_id
 
     publish_task = asyncio.create_task(
         app.state.event_hub.publish(

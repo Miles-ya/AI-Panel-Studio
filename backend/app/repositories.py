@@ -23,6 +23,35 @@ class DiscussionRepository:
     def get(self, discussion_id: str) -> Discussion | None:
         return self.session.get(Discussion, discussion_id)
 
+    def get_aggregate(
+        self, discussion_id: str
+    ) -> tuple[Discussion, list[Participant], list[Utterance], list[Insight]] | None:
+        discussion = self.get(discussion_id)
+        if discussion is None:
+            return None
+        participants = list(
+            self.session.scalars(
+                select(Participant)
+                .where(Participant.discussion_id == discussion_id)
+                .order_by(Participant.created_at, Participant.id)
+            )
+        )
+        utterances = list(
+            self.session.scalars(
+                select(Utterance)
+                .where(Utterance.discussion_id == discussion_id)
+                .order_by(Utterance.sequence)
+            )
+        )
+        insights = list(
+            self.session.scalars(
+                select(Insight)
+                .where(Insight.discussion_id == discussion_id, Insight.active.is_(True))
+                .order_by(Insight.created_at, Insight.id)
+            )
+        )
+        return discussion, participants, utterances, insights
+
     def list(self) -> list[Discussion]:
         return list(self.session.scalars(select(Discussion).order_by(Discussion.updated_at.desc())))
 

@@ -315,7 +315,6 @@ def _make_fixture(
     seed: bool = True,
 ) -> SqliteRunnerFixture:
     runner_type, event_hub_type, _ = runtime_contract
-    participant_type, utterance_type, insight_type = _repository_types()
     engine = database if isinstance(database, Engine) else create_sqlite_engine(f"sqlite:///{database}")
     if isinstance(database, Path):
         initialize_database(engine, seed=False)
@@ -328,20 +327,13 @@ def _make_fixture(
             active_insights=active_insights,
         )
     factory = sessionmaker(bind=engine)
-    discussion_repository = DiscussionRepository(factory())
-    participant_repository = participant_type(factory())
-    utterance_repository = utterance_type(factory())
-    insight_repository = insight_type(factory())
     event_hub = event_hub_type()
     if event_hub_wrapper is not None:
         event_hub = event_hub_wrapper(event_hub, factory)
     stop_event = asyncio.Event()
     runner = runner_type(
         discussion_id=discussion_id,
-        discussion_repository=discussion_repository,
-        participant_repository=participant_repository,
-        utterance_repository=utterance_repository,
-        insight_repository=insight_repository,
+        session_factory=factory,
         llm_provider=provider,
         event_hub=event_hub,
         stop_event=stop_event,

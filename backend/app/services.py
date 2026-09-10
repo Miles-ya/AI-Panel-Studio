@@ -20,6 +20,7 @@ from app.llm import (
 )
 from app.models import Discussion
 from app.repositories import DiscussionRepository
+from app.schemas import DiscussionDto, InsightDto, ParticipantDto, UtteranceDto
 
 
 class DiscussionNotFound(Exception):
@@ -107,6 +108,31 @@ class DiscussionService:
         if discussion is None:
             raise DiscussionNotFound
         return discussion
+
+    def snapshot(self, discussion_id: str) -> DiscussionDto:
+        aggregate = self.repository.get_aggregate(discussion_id)
+        if aggregate is None:
+            raise DiscussionNotFound
+        discussion, participants, utterances, insights = aggregate
+        return DiscussionDto(
+            id=discussion.id,
+            topic=discussion.topic,
+            expert_count=discussion.expert_count,
+            max_public_utterances=discussion.max_public_utterances,
+            status=discussion.status,
+            cast_confirmed=discussion.cast_confirmed,
+            cast_confirmed_at=discussion.cast_confirmed_at,
+            summary=discussion.summary,
+            summary_status=discussion.summary_status,
+            error_code=discussion.error_code,
+            created_at=discussion.created_at,
+            updated_at=discussion.updated_at,
+            started_at=discussion.started_at,
+            finished_at=discussion.finished_at,
+            participants=[ParticipantDto.model_validate(item) for item in participants],
+            utterances=[UtteranceDto.model_validate(item) for item in utterances],
+            insights=[InsightDto.model_validate(item) for item in insights],
+        )
 
     def confirm(self, discussion_id: str) -> Discussion:
         discussion = self.get(discussion_id)

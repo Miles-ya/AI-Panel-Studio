@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncGenerator
+import json
+from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.database import create_sqlite_engine, initialize_database
 from app.domain import DiscussionRuleViolation
-from app.llm import CastOutputValidationError, LLMProviderError
+from app.llm import CastOutputValidationError, DeepSeekLLMProvider, LLMProviderError
 from app.repositories import DiscussionRepository
+from app.runtime import DiscussionRunner, EventHub, RunnerRegistry
 from app.schemas import (
     ConfirmationDto,
     CreateDiscussionRequest,
@@ -21,7 +24,9 @@ from app.schemas import (
     DiscussionListResponse,
     ErrorBody,
     ErrorResponse,
+    RetrySummaryDto,
     StartDiscussionDto,
+    StopDiscussionDto,
 )
 from app.services import DiscussionNotFound, DiscussionService
 
@@ -77,6 +82,46 @@ def _session_factory() -> sessionmaker[Session]:
     return factory
 
 
+def _event_hub() -> EventHub:
+    hub = getattr(app.state, "event_hub", None)
+    if hub is None:
+        hub = EventHub()
+        app.state.event_hub = hub
+    return hub
+
+
+def _runner_registry() -> RunnerRegistry:
+    registry = getattr(app.state, "runner_registry", None)
+    if registry is None:
+        registry = RunnerRegistry()
+        app.state.runner_registry = registry
+    return registry
+
+
+def _new_runner(discussion_id: str) -> DiscussionRunner:
+    return DiscussionRunner(
+        discussion_id=discussion_id,
+        session_factory=_session_factory(),
+        llm_provider=DeepSeekLLMProvider(),
+        event_hub=_event_hub(),
+    )
+
+
+def _snapshot(discussion_id: str) -> DiscussionDto:
+    session = _session_factory()()
+    try:
+        return DiscussionService(DiscussionRepository(session)).snapshot(discussion_id)
+    finally:
+        session.close()
+
+
+def _sse_frame(event_name: str, payload: dict[str, Any]) -> bytes:
+    return (
+        f"event: {event_name}\n"
+        f"data: {json.dumps(jsonable_encoder(payload), ensure_ascii=False)}\n\n"
+    ).encode()
+
+
 async def get_session() -> AsyncGenerator[Session, None]:
     session = _session_factory()()
     try:
@@ -93,8 +138,9 @@ async def get_discussion_service(session: Session = Depends(get_session)) -> Dis
 async def create_discussion(
     request: CreateDiscussionRequest,
     service: DiscussionService = Depends(get_discussion_service),
-) -> Discussion:
-    return service.create(request.topic, request.expert_count)
+) -> DiscussionDto:
+    discussion = service.create(request.topic, request.expert_count)
+    return service.snapshot(discussion.id)
 
 
 @app.get("/api/discussions", response_model=DiscussionListResponse)
@@ -120,16 +166,17 @@ async def list_discussions(
 async def get_discussion(
     discussion_id: str,
     service: DiscussionService = Depends(get_discussion_service),
-) -> Discussion:
-    return service.get(discussion_id)
+) -> DiscussionDto:
+    return service.snapshot(discussion_id)
 
 
 @app.post("/api/discussions/{discussion_id}/generate-cast", response_model=DiscussionDto)
 async def generate_cast(
     discussion_id: str,
     service: DiscussionService = Depends(get_discussion_service),
-) -> Discussion:
-    return service.generate_cast(discussion_id)
+) -> DiscussionDto:
+    discussion = service.generate_cast(discussion_id)
+    return service.snapshot(discussion.id)
 
 
 @app.post("/api/discussions/{discussion_id}/confirm", response_model=ConfirmationDto)
@@ -153,8 +200,64 @@ async def start_discussion(
     service: DiscussionService = Depends(get_discussion_service),
 ) -> StartDiscussionDto:
     discussion = service.start(discussion_id)
+    try:
+        await _runner_registry().start(_new_runner(discussion_id))
+    except Exception as error:
+        discussion.status = "FAILED"
+        discussion.error_code = "RUNNER_START_FAILED"
+        service.repository.save(discussion)
+        raise LLMProviderError("讨论运行器启动失败。") from error
     return StartDiscussionDto(
         id=discussion.id,
         status=discussion.status,
         started_at=discussion.started_at,
     )
+
+
+@app.post("/api/discussions/{discussion_id}/stop", response_model=StopDiscussionDto, status_code=202)
+async def stop_discussion(
+    discussion_id: str,
+    service: DiscussionService = Depends(get_discussion_service),
+) -> StopDiscussionDto:
+    discussion = service.get(discussion_id)
+    if discussion.status != "RUNNING":
+        raise DiscussionRuleViolation("DISCUSSION_STATE_CONFLICT", "当前讨论未在运行。")
+    runner = _runner_registry().get(discussion_id)
+    if runner is None:
+        raise LLMProviderError("讨论运行器不可用。")
+    runner.request_stop()
+    return StopDiscussionDto(id=discussion.id, status=discussion.status, stop_requested=True)
+
+
+@app.post("/api/discussions/{discussion_id}/retry-summary", response_model=RetrySummaryDto, status_code=202)
+async def retry_summary(
+    discussion_id: str,
+    service: DiscussionService = Depends(get_discussion_service),
+) -> RetrySummaryDto:
+    discussion = service.get(discussion_id)
+    if discussion.status != "FINISHED" or discussion.summary_status != "fallback":
+        raise DiscussionRuleViolation("DISCUSSION_STATE_CONFLICT", "当前讨论无法重试总结。")
+    runner = _runner_registry().get(discussion_id) or _new_runner(discussion_id)
+    import asyncio
+    asyncio.create_task(runner.retry_summary())
+    return RetrySummaryDto(id=discussion.id, status=discussion.status, summary_status="pending", retry_requested=True)
+
+
+@app.get("/api/discussions/{discussion_id}/events")
+async def discussion_events(discussion_id: str) -> StreamingResponse:
+    snapshot = _snapshot(discussion_id)
+    hub = _event_hub()
+
+    async def stream() -> AsyncIterator[bytes]:
+        subscription = await hub.subscribe(discussion_id)
+        try:
+            yield _sse_frame(
+                "discussion.snapshot",
+                {"discussion_id": discussion_id, "discussion": snapshot.model_dump(mode="json")},
+            )
+            async for event in subscription:
+                yield _sse_frame(str(event["type"]), event)
+        finally:
+            hub.unsubscribe(discussion_id, subscription)
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
