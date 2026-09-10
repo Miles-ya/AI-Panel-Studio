@@ -29,6 +29,17 @@ def test_when_initialized_then_all_domain_tables_exist(database_url: str) -> Non
     assert {"discussions", "participants", "utterances", "insights"} <= tables
 
 
+def test_when_sqlite_parent_directory_is_missing_then_initialization_creates_it(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "new-local-data" / "ai_panel_studio.db"
+    engine = create_sqlite_engine(f"sqlite:///{database_path}")
+
+    initialize_database(engine, seed=False)
+
+    assert database_path.is_file()
+
+
 def test_when_foreign_keys_are_enabled_then_invalid_participant_is_rejected(
     database_url: str,
 ) -> None:

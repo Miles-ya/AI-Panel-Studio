@@ -150,6 +150,32 @@ async def test_when_creating_discussion_then_api_returns_normalized_draft_defaul
     assert body["status"] == "DRAFT"
 
 
+@pytest.mark.anyio
+async def test_when_frontend_uses_an_alternate_vite_port_then_api_allows_the_browser_request(
+    client: AsyncClient,
+) -> None:
+    response = await client.get(
+        "/api/discussions",
+        headers={"Origin": "http://127.0.0.1:5174"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5174"
+
+
+@pytest.mark.anyio
+async def test_when_request_origin_is_not_localhost_then_api_does_not_grant_cors_access(
+    client: AsyncClient,
+) -> None:
+    response = await client.get(
+        "/api/discussions",
+        headers={"Origin": "https://untrusted.example"},
+    )
+
+    assert response.status_code == 200
+    assert "access-control-allow-origin" not in response.headers
+
+
 @pytest.mark.parametrize("topic", ["   ", "x" * 301])
 @pytest.mark.anyio
 async def test_when_creating_discussion_with_invalid_topic_then_api_returns_error_dto(

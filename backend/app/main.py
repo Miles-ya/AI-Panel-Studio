@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.database import create_sqlite_engine, initialize_database
 from app.domain import DiscussionRuleViolation
+from app.environment import load_local_environment
 from app.llm import CastOutputValidationError, DeepSeekLLMProvider, DemoLLMProvider, LLMProviderError
 from app.repositories import DiscussionRepository
 from app.runtime import DiscussionRunner, EventHub, RunnerRegistry
@@ -32,10 +33,12 @@ from app.schemas import (
 from app.services import DiscussionNotFound, DiscussionService
 
 
+load_local_environment()
+
 app = FastAPI(title="AI Panel Studio", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    allow_origin_regex=r"https?://(?:127\.0\.0\.1|localhost):\d+",
     allow_methods=["*"],
     allow_headers=["*"],
 )

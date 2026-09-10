@@ -79,6 +79,7 @@ class DiscussionRunner:
         self.stop_event = stop_event or asyncio.Event()
         self.clock = clock or (lambda: datetime.now(UTC))
         self._previous_speaker_id: str | None = None
+        self._closing_requested = False
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -134,20 +135,30 @@ class DiscussionRunner:
             public_transcript = [PublicUtterance.model_validate(item) for item in transcript]
             public_insights = [PublicInsight.model_validate(item) for item in active_insights]
 
-        selection_input = SpeakerSelectionInput(
-            discussion_id=self.discussion_id,
-            participants=public_participants,
-            transcript=public_transcript,
-            active_insights=public_insights,
-            public_utterance_count=len(transcript),
-            previous_speaker_id=self._previous_speaker_id,
-            stop_requested=self.stop_event.is_set(),
-        )
-        selection = SpeakerSelector(self.llm_provider).select_next_speaker(selection_input)
-        selected = next(person for person in public_participants if str(person.id) == str(selection.participant_id))
+        closing = self._closing_requested or len(transcript) >= discussion.max_public_utterances - 1
+        if closing:
+            selected = next(person for person in public_participants if person.role == "moderator")
+            public_focus = "主持收束：总结讨论并保留关键分歧"
+        else:
+            selection_input = SpeakerSelectionInput(
+                discussion_id=self.discussion_id,
+                participants=public_participants,
+                transcript=public_transcript,
+                active_insights=public_insights,
+                public_utterance_count=len(transcript),
+                previous_speaker_id=self._previous_speaker_id,
+                stop_requested=self.stop_event.is_set(),
+            )
+            selector = SpeakerSelector(self.llm_provider)
+            if callable(getattr(self.llm_provider, "async_select_next_speaker", None)):
+                selection = await selector.select_next_speaker_async(selection_input)
+            else:
+                selection = selector.select_next_speaker(selection_input)
+            selected = next(person for person in public_participants if str(person.id) == str(selection.participant_id))
+            public_focus = selection.public_focus
 
-        await self._set_participant_status(str(selected.id), "preparing", selection.public_focus)
-        await self._set_participant_status(str(selected.id), "speaking", selection.public_focus)
+        await self._set_participant_status(str(selected.id), "preparing", public_focus)
+        await self._set_participant_status(str(selected.id), "speaking", public_focus)
 
         turn_input = TurnGenerationInput(
             discussion_id=self.discussion_id,
@@ -155,8 +166,13 @@ class DiscussionRunner:
             transcript=public_transcript,
             active_insights=public_insights,
             selected_participant=selected,
+            closing=closing,
         )
-        turn = TurnGenerator(self.llm_provider).generate_turn(turn_input)
+        generator = TurnGenerator(self.llm_provider)
+        if callable(getattr(self.llm_provider, "async_generate_turn", None)):
+            turn = await generator.generate_turn_async(turn_input)
+        else:
+            turn = generator.generate_turn(turn_input)
         saved = self._save_utterance(str(selected.id), turn.content)
         await self.event_hub.publish(
             {
@@ -203,7 +219,11 @@ class DiscussionRunner:
 
         await self._set_participant_status(str(selected.id), "idle", None)
         self._previous_speaker_id = str(selected.id)
-        if turn.should_end or self.stop_event.is_set() or self._utterance_count() >= 15:
+        if closing or (turn.should_end and selected.role == "moderator"):
+            await self._finish(summary=turn.content)
+        elif turn.should_end:
+            self._closing_requested = True
+        elif self.stop_event.is_set() or self._utterance_count() >= 15:
             await self._finish()
         return True
 
@@ -249,7 +269,7 @@ class DiscussionRunner:
             }
         )
 
-    async def _finish(self) -> None:
+    async def _finish(self, summary: str | None = None) -> None:
         with self.session_factory() as session:
             repository = DiscussionRepository(session)
             discussion = repository.get(self.discussion_id)
@@ -261,7 +281,10 @@ class DiscussionRunner:
             discussion.updated_at = now
             discussion.summary_status = "pending"
             repository.save(discussion)
+        fallback_summary = summary
         summary = await self._request_summary()
+        if summary is None:
+            summary = fallback_summary
         with self.session_factory() as session:
             repository = DiscussionRepository(session)
             discussion = repository.get(self.discussion_id)
@@ -285,13 +308,16 @@ class DiscussionRunner:
         )
 
     async def _request_summary(self) -> str | None:
+        async_summarizer = getattr(self.llm_provider, "async_summarize", None)
         summarizer = getattr(self.llm_provider, "summarize", None)
-        if summarizer is None:
+        if not callable(async_summarizer) and not callable(summarizer):
             return None
         with self.session_factory() as session:
             transcript = UtteranceRepository(session).list_for_discussion(self.discussion_id)
         for _ in range(2):
             try:
+                if callable(async_summarizer):
+                    return await async_summarizer(transcript)
                 return summarizer(transcript)
             except Exception:
                 continue

@@ -105,7 +105,7 @@ class PublicUtterance(BaseModel):
     model_config = ConfigDict(extra="forbid", from_attributes=True)
 
     participant_id: UUID
-    content: str = Field(min_length=1, max_length=300)
+    content: str = Field(min_length=1, max_length=500)
 
 
 class PublicInsight(BaseModel):
@@ -135,6 +135,7 @@ class TurnGenerationInput(BaseModel):
     transcript: list[PublicUtterance] = Field(default_factory=list)
     active_insights: list[PublicInsight] = Field(default_factory=list)
     selected_participant: PublicParticipant
+    closing: bool = False
 
 
 class SpeakerSelectionOutput(BaseModel):
@@ -199,7 +200,7 @@ class SpeakerSelectionOutput(BaseModel):
 class TurnOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    content: str = Field(min_length=1, max_length=300)
+    content: str = Field(min_length=1, max_length=500)
     should_end: StrictBool
 
     @field_validator("content", mode="before")
@@ -366,6 +367,7 @@ class DeepSeekLLMProvider:
         self.api_key = api_key if api_key is not None else os.getenv("DEEPSEEK_API_KEY")
         self.base_url = (base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")).rstrip("/")
         self.model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+        self.timeout_seconds = float(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "60"))
 
     def generate_cast(
         self, topic: str, expert_count: int, correction: str | None = None
@@ -383,25 +385,36 @@ class DeepSeekLLMProvider:
         }
         if correction is not None:
             prompt["correction"] = correction
-        try:
-            response = httpx.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": "Return only JSON matching the requested cast schema."},
-                        {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-                    ],
-                    "response_format": {"type": "json_object"},
-                },
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            return CastOutput.from_provider_response(json.loads(content))
-        except (httpx.HTTPError, KeyError, TypeError, json.JSONDecodeError) as error:
-            raise LLMProviderError("DeepSeek cast generation failed.") from error
+        for attempt in range(2):
+            try:
+                response = httpx.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": "Return only JSON matching the requested cast schema."},
+                            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+                        ],
+                        "response_format": {"type": "json_object"},
+                    },
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+                content = response.json()["choices"][0]["message"]["content"]
+                return CastOutput.from_provider_response(json.loads(content))
+            except httpx.TransportError as error:
+                if attempt == 0:
+                    continue
+                raise LLMProviderError("DeepSeek cast generation failed.") from error
+            except httpx.HTTPStatusError as error:
+                if attempt == 0 and error.response.status_code >= 500:
+                    continue
+                raise LLMProviderError("DeepSeek cast generation failed.") from error
+            except (KeyError, TypeError, json.JSONDecodeError) as error:
+                raise LLMProviderError("DeepSeek cast generation failed.") from error
+
+        raise AssertionError("The retry loop should either return or raise.")
 
     def select_next_speaker(
         self, input: SpeakerSelectionInput, correction: str | None = None
@@ -413,6 +426,7 @@ class DeepSeekLLMProvider:
             "active_insights": [item.model_dump(mode="json") for item in input.active_insights],
             "public_utterance_count": input.public_utterance_count,
             "previous_speaker_id": str(input.previous_speaker_id) if input.previous_speaker_id else None,
+            "selection_policy": "根据最新观点、分歧和待回应的问题自主选择最能推进讨论的嘉宾。不要按嘉宾列表、座位或轮流顺序选择发言人；优先回应、反驳、补充新证据、追问或收束。",
             "required_schema": {"participant_id": "UUID", "public_focus": "one short public focus, no line breaks, max 50 characters"},
         }
         if correction is not None:
@@ -423,49 +437,174 @@ class DeepSeekLLMProvider:
             error_message="DeepSeek speaker selection failed.",
         )
 
-    def generate_turn(
-        self, input: TurnGenerationInput, correction: str | None = None
+    async def async_select_next_speaker(
+        self, input: SpeakerSelectionInput, correction: str | None = None
     ) -> Mapping[str, object]:
         prompt = {
             "discussion_id": str(input.discussion_id),
             "participants": [person.model_dump(mode="json") for person in input.participants],
             "transcript": [item.model_dump(mode="json") for item in input.transcript],
             "active_insights": [item.model_dump(mode="json") for item in input.active_insights],
+            "public_utterance_count": input.public_utterance_count,
+            "previous_speaker_id": str(input.previous_speaker_id) if input.previous_speaker_id else None,
+            "selection_policy": "根据最新观点、分歧和待回应的问题自主选择最能推进讨论的嘉宾。不要按嘉宾列表、座位或轮流顺序选择发言人；优先回应、反驳、补充新证据、追问或收束。",
+            "required_schema": {"participant_id": "UUID", "public_focus": "one short public focus, no line breaks, max 50 characters"},
+        }
+        if correction is not None:
+            prompt["correction"] = correction
+        return await self._request_json_async(
+            prompt,
+            system_message="Return only JSON for the next public speaker and one short public focus. Do not provide reasoning or hidden analysis.",
+            error_message="DeepSeek speaker selection failed.",
+        )
+
+    def generate_turn(
+        self, input: TurnGenerationInput, correction: str | None = None
+    ) -> Mapping[str, object]:
+        closing_instruction = "Write a 300-500 Chinese-character moderator closing summary covering conclusions, remaining disagreements, and next steps." if input.closing else "Write 1-2 public sentences."
+        prompt = {
+            "discussion_id": str(input.discussion_id),
+            "participants": [person.model_dump(mode="json") for person in input.participants],
+            "transcript": [item.model_dump(mode="json") for item in input.transcript],
+            "active_insights": [item.model_dump(mode="json") for item in input.active_insights],
             "selected_participant": input.selected_participant.model_dump(mode="json"),
-            "required_schema": {"content": "1-2 public sentences, no line breaks, max 300 characters", "should_end": "boolean"},
+            "closing": input.closing,
+            "required_schema": {"content": "300-500 Chinese characters, no line breaks" if input.closing else "1-2 public sentences, no line breaks, max 300 characters", "should_end": "boolean"},
         }
         if correction is not None:
             prompt["correction"] = correction
         return self._request_json(
             prompt,
-            system_message="Return only 1-2 public sentences for the selected participant and whether the discussion should end. Do not provide reasoning or hidden analysis.",
+            system_message=f"Return only JSON. {closing_instruction} Include whether the discussion should end. Do not provide reasoning or hidden analysis.",
             error_message="DeepSeek turn generation failed.",
         )
+
+    async def async_generate_turn(
+        self, input: TurnGenerationInput, correction: str | None = None
+    ) -> Mapping[str, object]:
+        closing_instruction = "Write a 300-500 Chinese-character moderator closing summary covering conclusions, remaining disagreements, and next steps." if input.closing else "Write 1-2 public sentences."
+        prompt = {
+            "discussion_id": str(input.discussion_id),
+            "participants": [person.model_dump(mode="json") for person in input.participants],
+            "transcript": [item.model_dump(mode="json") for item in input.transcript],
+            "active_insights": [item.model_dump(mode="json") for item in input.active_insights],
+            "selected_participant": input.selected_participant.model_dump(mode="json"),
+            "closing": input.closing,
+            "required_schema": {"content": "300-500 Chinese characters, no line breaks" if input.closing else "1-2 public sentences, no line breaks, max 300 characters", "should_end": "boolean"},
+        }
+        if correction is not None:
+            prompt["correction"] = correction
+        return await self._request_json_async(
+            prompt,
+            system_message=f"Return only JSON. {closing_instruction} Include whether the discussion should end. Do not provide reasoning or hidden analysis.",
+            error_message="DeepSeek turn generation failed.",
+        )
+
+    def summarize(self, transcript: Sequence[PublicUtterance]) -> str | None:
+        if not transcript:
+            return None
+        response = self._request_json(
+            {
+                "transcript": [item.model_dump(mode="json") for item in transcript],
+                "required_schema": {"summary": "a concise Chinese summary, max 500 characters"},
+            },
+            system_message="Return only JSON with a concise public discussion summary. Do not provide reasoning or hidden analysis.",
+            error_message="DeepSeek summary generation failed.",
+        )
+        return self._summary_from_response(response)
+
+    async def async_summarize(self, transcript: Sequence[PublicUtterance]) -> str | None:
+        if not transcript:
+            return None
+        response = await self._request_json_async(
+            {
+                "transcript": [item.model_dump(mode="json") for item in transcript],
+                "required_schema": {"summary": "a concise Chinese summary, max 500 characters"},
+            },
+            system_message="Return only JSON with a concise public discussion summary. Do not provide reasoning or hidden analysis.",
+            error_message="DeepSeek summary generation failed.",
+        )
+        return self._summary_from_response(response)
+
+    @staticmethod
+    def _summary_from_response(response: Mapping[str, object]) -> str:
+        summary = response.get("summary")
+        if not isinstance(summary, str) or not summary.strip() or len(summary.strip()) > 500:
+            raise LLMProviderError("DeepSeek summary generation failed.")
+        return summary.strip()
 
     def _request_json(
         self, prompt: dict[str, object], *, system_message: str, error_message: str
     ) -> Mapping[str, object]:
         if not self.api_key:
             raise LLMProviderError("DeepSeek API key is not configured.")
-        try:
-            response = httpx.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": system_message},
-                        {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-                    ],
-                    "response_format": {"type": "json_object"},
-                },
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            payload = json.loads(content)
-            if not isinstance(payload, Mapping):
-                raise TypeError("model response must be an object")
-            return payload
-        except (httpx.HTTPError, KeyError, TypeError, json.JSONDecodeError) as error:
-            raise LLMProviderError(error_message) from error
+        for attempt in range(2):
+            try:
+                response = httpx.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": system_message},
+                            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+                        ],
+                        "response_format": {"type": "json_object"},
+                    },
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+                content = response.json()["choices"][0]["message"]["content"]
+                payload = json.loads(content)
+                if not isinstance(payload, Mapping):
+                    raise TypeError("model response must be an object")
+                return payload
+            except httpx.TransportError as error:
+                if attempt == 0:
+                    continue
+                raise LLMProviderError(error_message) from error
+            except httpx.HTTPStatusError as error:
+                if attempt == 0 and error.response.status_code >= 500:
+                    continue
+                raise LLMProviderError(error_message) from error
+            except (KeyError, TypeError, json.JSONDecodeError) as error:
+                raise LLMProviderError(error_message) from error
+        raise AssertionError("unreachable")
+
+    async def _request_json_async(
+        self, prompt: dict[str, object], *, system_message: str, error_message: str
+    ) -> Mapping[str, object]:
+        if not self.api_key:
+            raise LLMProviderError("DeepSeek API key is not configured.")
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                    response = await client.post(
+                        f"{self.base_url}/chat/completions",
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        json={
+                            "model": self.model,
+                            "messages": [
+                                {"role": "system", "content": system_message},
+                                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+                            ],
+                            "response_format": {"type": "json_object"},
+                        },
+                    )
+                response.raise_for_status()
+                content = response.json()["choices"][0]["message"]["content"]
+                payload = json.loads(content)
+                if not isinstance(payload, Mapping):
+                    raise TypeError("model response must be an object")
+                return payload
+            except httpx.TransportError as error:
+                if attempt == 0:
+                    continue
+                raise LLMProviderError(error_message) from error
+            except httpx.HTTPStatusError as error:
+                if attempt == 0 and error.response.status_code >= 500:
+                    continue
+                raise LLMProviderError(error_message) from error
+            except (KeyError, TypeError, json.JSONDecodeError) as error:
+                raise LLMProviderError(error_message) from error
+        raise AssertionError("unreachable")

@@ -25,14 +25,29 @@ docs/       产品、领域模型、API 契约和架构文档
 - `docs/03-api-contract.md`：REST API 与 SSE 事件契约
 - `docs/04-architecture.md`：分层架构、实时机制与测试策略
 
-## 本地开发（实现后）
+## 本地开发
 
-1. 复制环境变量：`cp .env.example .env`
-2. 在 `backend/` 安装后端依赖并启动 API 服务。
-3. 在 `frontend/` 安装前端依赖并启动开发服务器。
-4. 访问前端开发地址。
+首次安装依赖：
 
-具体命令将在技术栈确定后补充。
+```bash
+npm install
+cd backend && uv sync --all-extras && cd ..
+```
+
+在 `backend/.env` 配置模型密钥后，从项目根目录一键启动前后端：
+
+```bash
+npm run dev
+```
+
+也可以单独启动：
+
+```bash
+npm run dev:backend
+npm run dev:frontend
+```
+
+后端会自动读取 `backend/.env`，默认运行在 `http://127.0.0.1:8000`；前端地址会显示在终端中。
 
 ## 安全说明
 

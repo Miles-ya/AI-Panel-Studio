@@ -1,11 +1,17 @@
 {
   "name": "ai-panel-studio",
   "private": true,
-  "workspaces": ["frontend"],
+  "workspaces": [
+    "frontend"
+  ],
   "scripts": {
+    "dev": "concurrently --names backend,frontend --kill-others-on-fail \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "cd backend && ./.venv/bin/uvicorn app.main:app --reload",
+    "dev:frontend": "npm run dev --workspace=frontend",
     "e2e:list": "playwright test --list"
   },
   "devDependencies": {
-    "@playwright/test": "^1.57.0"
+    "@playwright/test": "^1.57.0",
+    "concurrently": "^9.2.4"
   }
 }

@@ -54,6 +54,29 @@ class SpeakerSelector:
                 correction = error.correction
         raise AssertionError("unreachable")
 
+    async def select_next_speaker_async(
+        self, input: SpeakerSelectionInput
+    ) -> SpeakerSelectionOutput:
+        request = getattr(self.llm_provider, "async_select_next_speaker")
+        correction: str | None = None
+        for attempt in range(2):
+            try:
+                candidate = SpeakerSelectionOutput.from_provider_response(
+                    await request(input, correction=correction)
+                )
+                candidate.validate_for(
+                    str(input.discussion_id),
+                    input.participants,
+                    str(input.previous_speaker_id) if input.previous_speaker_id else None,
+                    input.public_utterance_count, input.stop_requested,
+                )
+                return candidate
+            except SpeakerSelectionOutputValidationError as error:
+                if attempt == 1:
+                    raise
+                correction = error.correction
+        raise AssertionError("unreachable")
+
 
 class TurnGenerator:
     """Coordinates TurnOutput parsing and one correction retry."""
@@ -67,6 +90,20 @@ class TurnGenerator:
             try:
                 return TurnOutput.from_provider_response(
                     self.llm_provider.generate_turn(input, correction=correction)
+                )
+            except TurnOutputValidationError as error:
+                if attempt == 1:
+                    raise
+                correction = error.correction
+        raise AssertionError("unreachable")
+
+    async def generate_turn_async(self, input: TurnGenerationInput) -> TurnOutput:
+        request = getattr(self.llm_provider, "async_generate_turn")
+        correction: str | None = None
+        for attempt in range(2):
+            try:
+                return TurnOutput.from_provider_response(
+                    await request(input, correction=correction)
                 )
             except TurnOutputValidationError as error:
                 if attempt == 1:

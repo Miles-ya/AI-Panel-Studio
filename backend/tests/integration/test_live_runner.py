@@ -470,14 +470,42 @@ async def test_user_stop_prevents_the_next_round_at_a_safe_point(sqlite_runner: 
 
 
 @pytest.mark.anyio
-async def test_fifteenth_saved_utterance_is_last_and_triggers_completion(sqlite_runner: Path) -> None:
+async def test_slow_synchronous_provider_call_does_not_block_the_event_loop(
+    sqlite_runner: Path,
+) -> None:
     runtime_contract = _runtime_contract()
     fixture = _make_fixture(
         sqlite_runner,
         runtime_contract=runtime_contract,
         provider=ScriptedProvider(
-            selections=[{"participant_id": EXPERT_TWO_ID, "public_focus": "继续"}],
-            turns=[{"content": "第 15 条", "should_end": False}],
+            selections=[{"participant_id": MODERATOR_ID, "public_focus": "开始"}],
+            turns=[{"content": "首条发言", "should_end": True}],
+            insights=[{"consensus": [], "disagreement": []}],
+            summaries=["完成"],
+        ),
+    )
+    async def async_select_next_speaker(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        await asyncio.sleep(0.1)
+        return fixture.provider.select_next_speaker(*args, **kwargs)
+
+    fixture.provider.async_select_next_speaker = async_select_next_speaker  # type: ignore[attr-defined]
+    task = asyncio.create_task(fixture.runner.run_one_turn())
+
+    await asyncio.sleep(0.01)
+
+    assert not task.done()
+    await task
+
+
+@pytest.mark.anyio
+async def test_fifteenth_slot_is_reserved_for_the_moderator_closing_statement(sqlite_runner: Path) -> None:
+    runtime_contract = _runtime_contract()
+    fixture = _make_fixture(
+        sqlite_runner,
+        runtime_contract=runtime_contract,
+        provider=ScriptedProvider(
+            selections=[],
+            turns=[{"content": "主持人第 15 条收束", "should_end": True}],
             insights=[{"consensus": [], "disagreement": []}],
             summaries=["达到公开发言上限"],
         ),
@@ -487,14 +515,14 @@ async def test_fifteenth_saved_utterance_is_last_and_triggers_completion(sqlite_
     await fixture.runner.run()
 
     assert len(fixture.contents()) == 15
-    assert fixture.contents()[-1] == "第 15 条"
-    assert fixture.provider.selection_calls == 1
+    assert fixture.contents()[-1] == "主持人第 15 条收束"
+    assert fixture.provider.selection_calls == 0
     assert fixture.provider.turn_calls == 1
     assert fixture.status() == "FINISHED"
 
 
 @pytest.mark.anyio
-async def test_summary_retries_then_falls_back_and_manual_retry_recovers(sqlite_runner: Path) -> None:
+async def test_manual_summary_retry_recovers_a_legacy_fallback_discussion(sqlite_runner: Path) -> None:
     runtime_contract = _runtime_contract()
     fixture = _make_fixture(
         sqlite_runner,
@@ -503,7 +531,7 @@ async def test_summary_retries_then_falls_back_and_manual_retry_recovers(sqlite_
             selections=[{"participant_id": MODERATOR_ID, "public_focus": "收束"}],
             turns=[{"content": "最后一条", "should_end": True}],
             insights=[{"consensus": [], "disagreement": []}],
-            summaries=[RuntimeError("summary failed"), RuntimeError("summary failed again"), "重试成功"],
+            summaries=["调解总结", "重试成功"],
         ),
     )
 
@@ -514,7 +542,11 @@ async def test_summary_retries_then_falls_back_and_manual_retry_recovers(sqlite_
         assert discussion is not None
         assert discussion.status == "FINISHED"
         assert discussion.finished_at is not None
-        assert discussion.summary_status == "fallback"
+        assert discussion.summary == "调解总结"
+        assert discussion.summary_status == "succeeded"
+        discussion.summary = "总结暂不可用"
+        discussion.summary_status = "fallback"
+        session.commit()
     utterance_count = len(fixture.contents())
 
     await fixture.runner.retry_summary()
@@ -526,6 +558,47 @@ async def test_summary_retries_then_falls_back_and_manual_retry_recovers(sqlite_
         assert discussion.summary_status == "succeeded"
     assert len(fixture.contents()) == utterance_count
     assert fixture.provider.selection_calls == 1
+
+
+@pytest.mark.anyio
+async def test_expert_end_request_adds_a_moderator_closing_statement_as_the_summary(
+    sqlite_runner: Path,
+) -> None:
+    runtime_contract = _runtime_contract()
+    fixture = _make_fixture(
+        sqlite_runner,
+        runtime_contract=runtime_contract,
+        provider=ScriptedProvider(
+            selections=[
+                {"participant_id": EXPERT_ONE_ID, "public_focus": "提出最后观点"},
+            ],
+            turns=[
+                {"content": "专家请求结束。", "should_end": True},
+                {"content": "主持人收束：保留分歧并明确下一步。", "should_end": True},
+            ],
+            insights=[
+                {"consensus": [], "disagreement": []},
+                {"consensus": [], "disagreement": []},
+            ],
+            summaries=["AI 调解总结"],
+        ),
+        initial_utterance_count=1,
+    )
+
+    await fixture.runner.run()
+
+    assert fixture.status() == "FINISHED"
+    assert fixture.provider.turn_calls == 2
+    assert fixture.contents() == [
+        "既有发言 1",
+        "专家请求结束。",
+        "主持人收束：保留分歧并明确下一步。",
+    ]
+    with fixture.session() as session:
+        discussion = session.get(Discussion, fixture.discussion_id)
+        assert discussion is not None
+        assert discussion.status == "FINISHED"
+        assert discussion.summary == "AI 调解总结"
 
 
 @pytest.mark.anyio
