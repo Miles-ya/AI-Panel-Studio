@@ -348,7 +348,7 @@ class DemoLLMProvider:
         }
 
     def summarize(self, transcript: Sequence[Any]) -> str | None:
-        discussion_id = str(transcript[0].discussion_id) if transcript else "empty"
+        discussion_id = str(transcript[0].participant_id) if transcript else "empty"
         attempts = self._summary_attempts.get(discussion_id, 0)
         self._summary_attempts[discussion_id] = attempts + 1
         if self.summary_mode == "fallback_once" and attempts == 0:

@@ -8,7 +8,11 @@
     "dev": "concurrently --names backend,frontend --kill-others-on-fail \"npm run dev:backend\" \"npm run dev:frontend\"",
     "dev:backend": "cd backend && ./.venv/bin/uvicorn app.main:app --reload",
     "dev:frontend": "npm run dev --workspace=frontend",
-    "e2e:list": "playwright test --list"
+    "e2e:list": "playwright test --list",
+    "test:backend": "cd backend && ./.venv/bin/pytest -q",
+    "test:frontend": "npm run lint --workspace=frontend && npm run typecheck --workspace=frontend && npm run build --workspace=frontend",
+    "test:e2e": "playwright test",
+    "quality": "npm run test:backend && npm run test:frontend && npm run test:e2e"
   },
   "devDependencies": {
     "@playwright/test": "^1.57.0",
