@@ -98,7 +98,7 @@ def _session_factory() -> sessionmaker[Session]:
         engine = create_sqlite_engine(
             os.getenv("DATABASE_URL", "sqlite:///./data/ai_panel_studio.db")
         )
-        initialize_database(engine, seed=False)
+        initialize_database(engine, seed=True)
         factory = sessionmaker(bind=engine)
         app.state.session_factory = factory
     return factory

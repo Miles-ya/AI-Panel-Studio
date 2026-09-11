@@ -11,6 +11,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+import app.main as main_module
 from app.database import create_sqlite_engine, initialize_database
 from app.main import app
 from app.models import Discussion, Participant
@@ -19,6 +20,23 @@ from app.models import Discussion, Participant
 @pytest.fixture()
 def anyio_backend() -> str:
     return "asyncio"
+
+
+def test_when_application_creates_its_default_database_then_demo_discussions_are_seeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = create_sqlite_engine(f"sqlite:///{tmp_path / 'application.db'}")
+    monkeypatch.delattr(app.state, "session_factory", raising=False)
+    monkeypatch.setattr(main_module, "create_sqlite_engine", lambda _: engine)
+
+    factory = main_module._session_factory()
+
+    with factory() as session:
+        discussions = session.query(Discussion).all()
+        participants = session.query(Participant).all()
+
+    assert len(discussions) == 5
+    assert len(participants) == 25
 
 
 @pytest.fixture(autouse=True)

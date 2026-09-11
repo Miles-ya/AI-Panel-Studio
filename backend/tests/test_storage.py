@@ -148,7 +148,7 @@ def test_when_initialized_twice_then_seed_is_not_duplicated_or_overwritten(
         assert session.scalar(select(Discussion.topic).where(Discussion.id == first_discussion_id)) == "用户自定义主题"
 
 
-def test_when_seeded_then_each_discussion_has_one_moderator_and_four_experts(
+def test_when_seeded_then_each_discussion_is_a_complete_finished_studio_sample(
     database_url: str,
 ) -> None:
     engine = create_sqlite_engine(database_url)
@@ -161,12 +161,27 @@ def test_when_seeded_then_each_discussion_has_one_moderator_and_four_experts(
             participants = session.scalars(
                 select(Participant).where(Participant.discussion_id == discussion.id)
             ).all()
-            assert discussion.status == "CAST_READY"
-            assert discussion.cast_confirmed is False
+            utterances = session.scalars(
+                select(Utterance)
+                .where(Utterance.discussion_id == discussion.id)
+                .order_by(Utterance.sequence)
+            ).all()
+            insights = session.scalars(
+                select(Insight).where(Insight.discussion_id == discussion.id, Insight.active.is_(True))
+            ).all()
+            assert discussion.status == "FINISHED"
+            assert discussion.cast_confirmed is True
+            assert discussion.summary_status == "succeeded"
+            assert discussion.summary
+            assert discussion.started_at
+            assert discussion.finished_at
             assert sum(person.role == "moderator" for person in participants) == 1
             assert sum(person.role == "expert" for person in participants) == 4
             assert len({person.color for person in participants}) == 5
             assert {person.stance for person in participants}
+            assert len(utterances) >= 4
+            assert [item.sequence for item in utterances] == list(range(1, len(utterances) + 1))
+            assert {item.type for item in insights} == {"consensus", "disagreement"}
 
 
 def test_when_serializing_contract_dtos_then_only_documented_public_fields_are_exposed() -> None:
